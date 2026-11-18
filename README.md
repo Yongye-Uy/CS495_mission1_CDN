@@ -1,10 +1,10 @@
-# Mission 1 — Distributed File Storage / Mini CDN (UPDATE 5)
+# Mission 1 — Distributed File Storage / Mini CDN
 
 A distributed file storage and content delivery network (Mini CDN) built in idiomatic **Go** using **Gin**, designed for university Distributed Systems coursework.
 
 ---
 
-## 1. Project Overview & UPDATE 5 Capabilities
+## 1. Project Overview
 
 The system replicates files across distributed storage worker nodes and dynamically serves files to clients from the geographically nearest healthy storage node using great-circle Haversine routing with automatic failover.
 
