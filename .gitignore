@@ -1,0 +1,25 @@
+# Binaries
+bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+/on_board
+/storage-server
+/api-bin
+/website-bin
+
+# Test binary, generated with `go test -c`
+*.test
+
+# Output of the go coverage tool
+*.out
+
+# Data directories
+data/
+/Storage/data/
+/Docker/storage/data/
+
+# Docker local simulation folder (excluded as requested)
+Docker/
