@@ -72,13 +72,14 @@ func Load() *Config {
 		}
 	}
 
-	// 3. Fallback to default storage node (Singapore)
+	// 3. Fallback to optional local development storage node
 	if len(storageNodes) == 0 {
-		localURL := getEnv("STORAGE_LOCAL_URL", "http://localhost:8081")
-		storageNodes = append(storageNodes, models.Replica{
-			Location: "singapore",
-			URL:      strings.TrimRight(localURL, "/"),
-		})
+		if localURL := os.Getenv("STORAGE_LOCAL_URL"); localURL != "" {
+			storageNodes = append(storageNodes, models.Replica{
+				Location: "singapore",
+				URL:      strings.TrimRight(localURL, "/"),
+			})
+		}
 	}
 
 	return &Config{
