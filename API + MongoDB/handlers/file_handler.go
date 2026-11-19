@@ -177,7 +177,6 @@ func (h *FileHandler) Get(c *gin.Context) {
 	defer stream.Close()
 
 	c.Header("Content-Type", meta.ContentType)
-	c.Header("Content-Length", fmt.Sprintf("%d", meta.Size))
 	c.Header("Content-Disposition", fmt.Sprintf(`inline; filename="%s"`, meta.OriginalName))
 	c.Header("X-Served-By-Storage", servedByLoc)
 
