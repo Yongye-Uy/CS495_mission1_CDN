@@ -1,9 +1,12 @@
 package config
 
 import (
+	"encoding/json"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 type Config struct {
@@ -16,7 +19,11 @@ type Config struct {
 func Load() *Config {
 	loadEnvFile(".env", "../.env")
 
-	location := getEnv("STORAGE_LOCATION", "singapore")
+	location := getEnv("STORAGE_LOCATION", "auto")
+	if strings.ToLower(location) == "auto" || strings.TrimSpace(location) == "" {
+		location = detectLocation()
+	}
+
 	nodeID := getEnv("STORAGE_NODE_ID", "node-"+location)
 	port := getEnv("STORAGE_PORT", "8081")
 	dataDir := getEnv("STORAGE_DATA_DIR", "./data/files")
@@ -29,6 +36,30 @@ func Load() *Config {
 		Port:     port,
 		DataDir:  cleanDataDir,
 	}
+}
+
+func detectLocation() string {
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get("https://ipapi.co/json/")
+	if err == nil && resp.StatusCode == http.StatusOK {
+		defer resp.Body.Close()
+		var geo struct {
+			City        string `json:"city"`
+			CountryName string `json:"country_name"`
+			CountryCode string `json:"country_code"`
+		}
+		if json.NewDecoder(resp.Body).Decode(&geo) == nil {
+			c := strings.ToLower(strings.TrimSpace(geo.City))
+			if c != "" {
+				return c
+			}
+			cnt := strings.ToLower(strings.TrimSpace(geo.CountryName))
+			if cnt != "" {
+				return cnt
+			}
+		}
+	}
+	return "singapore"
 }
 
 func getEnv(key, defaultVal string) string {
