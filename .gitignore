@@ -23,3 +23,8 @@ data/
 
 # Docker local simulation folder (excluded as requested)
 Docker/
+
+# Setup documentation (kept on local machine only, excluded from GitHub)
+API_SERVER_SETUP.md
+STORAGE_SERVER_SETUP.md
+WEBSITE_SERVER_SETUP.md
