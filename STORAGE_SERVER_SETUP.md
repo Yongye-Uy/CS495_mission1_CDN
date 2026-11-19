@@ -98,6 +98,15 @@ curl -s -o /var/cdn/data/<FILE_ID> https://flagcdn.com/w640/us.png
 // ON SERVER #5 (LONDON STORAGE):
 // Replace the file content with the UK flag:
 curl -s -o /var/cdn/data/<FILE_ID> https://flagcdn.com/w640/gb.png
+
+
+// (OPTIONAL) LOCK THE FILE SO NOTHING CAN OVERWRITE IT:
+sudo chmod 444 /var/cdn/data/<FILE_ID>
+// OR MAKE IT COMPLETELY IMMUTABLE:
+sudo chattr +i /var/cdn/data/<FILE_ID>
+
+// (TO UNLOCK LATER IF NEEDED):
+sudo chattr -i /var/cdn/data/<FILE_ID>
 ```
 *(Replace `<FILE_ID>` with your real File ID, e.g. `/var/cdn/data/f_1794907067_23aa6bc581e6d23b`)*
 
