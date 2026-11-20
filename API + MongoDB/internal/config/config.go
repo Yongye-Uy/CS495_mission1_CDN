@@ -31,7 +31,7 @@ func Load() *Config {
 
 	port := getEnv("API_PORT", "8080")
 	env := getEnv("API_ENV", "development")
-	mongoURI := getEnv("MONGO_URI", "mongodb://localhost:27017/cdn_metadata?replicaSet=rs0&directConnection=true")
+	mongoURI := getEnv("MONGO_URI", "mongodb://localhost:27017/cdn_metadata")
 	mongoDB := getEnv("MONGO_DB", "cdn_metadata")
 
 	maxUploadMB, err := strconv.ParseInt(getEnv("MAX_UPLOAD_SIZE_MB", "100"), 10, 64)

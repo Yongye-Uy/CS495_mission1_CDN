@@ -14,7 +14,7 @@ The architecture consists of **two production applications** plus **native Linux
 2. **Central API Controller (`API + MongoDB/`):**
    - Central coordinator orchestrating file metadata, GeoIP proximity routing, and parallel replication.
    - Ephemeral upload buffering via `os.CreateTemp()` — uploads buffer temporarily for rsync and are automatically deleted upon upload completion.
-   - Persistent storage in **MongoDB** configured with a single-node replica set (`rs0`).
+   - Persistent storage in standard standalone **MongoDB**.
    - In-memory read-write **Mutation Barrier** ensuring consistency during node synchronization.
 3. **Storage Servers (Native Linux / AWS Lightsail):**
    - Ordinary Linux machines running standard **OpenSSH**, **SFTP**, and **rsync** under a dedicated `cdn-sync` user with `/var/cdn/data` (`chmod 750`).
@@ -53,7 +53,7 @@ The architecture consists of **two production applications** plus **native Linux
                         │                             │
                         ▼                             ▼
              ┌─────────────────────┐       ┌─────────────────────┐
-             │    MongoDB (rs0)    │       │ Storage Nodes (SSH) │
+             │  MongoDB (Database) │       │ Storage Nodes (SSH) │
              │      Port 27017     │       │ • Singapore (sg)    │
              │  ─────────────────  │       │ • US (us)           │
              │  • files            │       │ • London (lon)      │
