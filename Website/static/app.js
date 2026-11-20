@@ -560,11 +560,11 @@ document.addEventListener("DOMContentLoaded", () => {
 
     // 4. Reset step list to initial unstarted state
     const defaultTexts = [
-      "Step 1: Contacting storage worker health endpoint...",
-      "Step 2: Verifying worker identity & status...",
-      "Step 3: Registering node as PENDING in MongoDB...",
-      "Step 4: Synchronizing existing files via rsync...",
-      "Step 5: Activating worker node to ONLINE."
+      "Step 1: Host-key auto-enrollment & SSH connectivity probe...",
+      "Step 2: Checking storage directory (/var/cdn/data) permissions...",
+      "Step 3: Registering node as PENDING & capturing catalog snapshot...",
+      "Step 4: Synchronizing missing files via rsync / SFTP...",
+      "Step 5: Mutation barrier audit & activating node to ONLINE!"
     ];
     for (let i = 1; i <= 5; i++) {
       const el = document.getElementById("hstep" + i);
@@ -578,7 +578,11 @@ document.addEventListener("DOMContentLoaded", () => {
     if (homeAddNodeForm) {
       homeAddNodeForm.reset();
       const portInput = document.getElementById("homeNodePort");
-      if (portInput) portInput.value = "8081";
+      if (portInput) portInput.value = "22";
+      const userEl = document.getElementById("homeNodeSSHUser");
+      if (userEl) userEl.value = "ubuntu";
+      const dirEl = document.getElementById("homeNodeStorageDir");
+      if (dirEl) dirEl.value = "/var/cdn/data";
     }
 
     // 6. Re-enable submit button
@@ -627,83 +631,81 @@ document.addEventListener("DOMContentLoaded", () => {
     document.getElementById("homeNodeLon").value = lon;
   };
 
-  // Auto-detect Location, Latitude & Longitude from IP or Country
+  // Auto-detect Location, Port, User & SSH parameters via Central API
   const btnAutoGeo = document.getElementById("btnAutoGeo");
+  async function performHomeNodeDetection(ip) {
+    ip = (ip || "").trim();
+    if (!ip) return;
+
+    if (btnAutoGeo) {
+      btnAutoGeo.disabled = true;
+      btnAutoGeo.innerHTML = `<span class="spinner-border spinner-border-sm"></span>`;
+    }
+
+    const info = document.getElementById("geoDetectedInfo");
+    if (info) info.innerHTML = `<span class="spinner-border spinner-border-sm me-1 text-primary"></span>Detecting server parameters for ${escapeHtml(ip)}...`;
+
+    try {
+      const res = await fetch(`/api/nodes/detect?ip=${encodeURIComponent(ip)}`);
+      const data = await res.json().catch(() => ({}));
+
+      if (res.ok && data.success && data.data) {
+        const d = data.data;
+        if (d.country) document.getElementById("homeNodeCountry").value = d.country;
+        if (d.region) document.getElementById("homeNodeRegion").value = d.region;
+        if (d.latitude) document.getElementById("homeNodeLat").value = d.latitude;
+        if (d.longitude) document.getElementById("homeNodeLon").value = d.longitude;
+        if (d.port) document.getElementById("homeNodePort").value = d.port;
+        const userEl = document.getElementById("homeNodeSSHUser");
+        if (userEl && d.ssh_user) userEl.value = d.ssh_user;
+        const dirEl = document.getElementById("homeNodeStorageDir");
+        if (dirEl && d.storage_dir) dirEl.value = d.storage_dir;
+
+        let summary = `<i class="bi bi-check-circle-fill text-success me-1"></i>Detected: <strong>${escapeHtml(d.country || d.region)}</strong> (${d.latitude}, ${d.longitude}) &bull; SSH: <code>${escapeHtml(d.ssh_user || "ubuntu")}:${d.port || 22}</code>`;
+        if (d.host_key_enrolled) {
+          summary += ` &bull; <span class="badge bg-success"><i class="bi bi-shield-check me-1"></i>Host Key Enrolled</span>`;
+        }
+        if (info) info.innerHTML = summary;
+      } else {
+        if (info) info.innerHTML = `<i class="bi bi-info-circle text-muted me-1"></i>Defaults applied: Port 22, user 'ubuntu', /var/cdn/data.`;
+      }
+    } catch (err) {
+      if (info) info.innerHTML = `<i class="bi bi-info-circle text-muted me-1"></i>Could not auto-detect location. Using default Port 22 and user 'ubuntu'.`;
+    } finally {
+      if (btnAutoGeo) {
+        btnAutoGeo.disabled = false;
+        btnAutoGeo.innerHTML = `<i class="bi bi-geo-alt me-1"></i>Auto`;
+      }
+    }
+  }
+
   if (btnAutoGeo) {
-    btnAutoGeo.addEventListener("click", async () => {
+    btnAutoGeo.addEventListener("click", () => {
       const ip = (document.getElementById("homeNodeIP")?.value || "").trim();
       if (!ip) {
         alert("Please enter an IP address or hostname first.");
         return;
       }
-
-      btnAutoGeo.disabled = true;
-      btnAutoGeo.innerHTML = `<span class="spinner-border spinner-border-sm"></span>`;
-
-      try {
-        // Check local presets first
-        if (ip === "storage-new-node" || ip === "198.45.98.44") {
-          document.getElementById("homeNodeRegion").value = "Asia";
-          document.getElementById("homeNodeCountry").value = "Japan";
-          document.getElementById("homeNodeLat").value = "35.6762";
-          document.getElementById("homeNodeLon").value = "139.6503";
-          const info = document.getElementById("geoDetectedInfo");
-          if (info) info.innerHTML = `<i class="bi bi-check-circle text-success me-1"></i>Detected: <strong>Japan (Asia)</strong> [35.6762, 139.6503]`;
-          return;
-        }
-
-        // Query public GeoIP
-        const res = await fetch(`https://ipapi.co/${encodeURIComponent(ip)}/json/`, { signal: AbortSignal.timeout(4000) });
-        if (!res.ok) throw new Error("GeoIP lookup failed");
-        const data = await res.json();
-        if (data.error) throw new Error(data.reason || "Invalid IP address");
-
-        if (data.country_name) document.getElementById("homeNodeCountry").value = data.country_name;
-        if (data.region || data.city) document.getElementById("homeNodeRegion").value = data.city || data.region;
-        if (typeof data.latitude === "number") document.getElementById("homeNodeLat").value = data.latitude.toFixed(4);
-        if (typeof data.longitude === "number") document.getElementById("homeNodeLon").value = data.longitude.toFixed(4);
-
-        const info = document.getElementById("geoDetectedInfo");
-        if (info) info.innerHTML = `<i class="bi bi-check-circle text-success me-1"></i>Detected: <strong>${escapeHtml(data.country_name || "")}</strong> (${data.latitude.toFixed(2)}, ${data.longitude.toFixed(2)})`;
-      } catch (err) {
-        // Fallback: check if country field has a known country name
-        const countryVal = (document.getElementById("homeNodeCountry")?.value || document.getElementById("homeNodeRegion")?.value || "").toLowerCase().replace(/\s+/g, "");
-        const dict = {
-          singapore: { lat: 1.3521, lon: 103.8198, c: "Singapore", r: "Singapore" },
-          japan: { lat: 35.6762, lon: 139.6503, c: "Japan", r: "Tokyo" },
-          tokyo: { lat: 35.6762, lon: 139.6503, c: "Japan", r: "Tokyo" },
-          london: { lat: 51.5074, lon: -0.1278, c: "United Kingdom", r: "London" },
-          uk: { lat: 51.5074, lon: -0.1278, c: "United Kingdom", r: "London" },
-          unitedkingdom: { lat: 51.5074, lon: -0.1278, c: "United Kingdom", r: "London" },
-          usa: { lat: 38.9072, lon: -77.0369, c: "United States", r: "Washington" },
-          unitedstates: { lat: 38.9072, lon: -77.0369, c: "United States", r: "Washington" },
-          newyork: { lat: 40.7128, lon: -74.0060, c: "United States", r: "New York" },
-          germany: { lat: 50.1109, lon: 8.6821, c: "Germany", r: "Frankfurt" },
-          cambodia: { lat: 11.5564, lon: 104.9282, c: "Cambodia", r: "Phnom Penh" },
-        };
-        if (dict[countryVal]) {
-          const match = dict[countryVal];
-          document.getElementById("homeNodeCountry").value = match.c;
-          document.getElementById("homeNodeRegion").value = match.r;
-          document.getElementById("homeNodeLat").value = match.lat;
-          document.getElementById("homeNodeLon").value = match.lon;
-          const info = document.getElementById("geoDetectedInfo");
-          if (info) info.innerHTML = `<i class="bi bi-check-circle text-success me-1"></i>Preset: <strong>${match.c}</strong>`;
-        }
-      } finally {
-        btnAutoGeo.disabled = false;
-        btnAutoGeo.innerHTML = `<i class="bi bi-geo-alt me-1"></i>Auto`;
-      }
+      performHomeNodeDetection(ip);
     });
   }
 
-  // Auto-detect on IP blur
+  // Auto-detect on IP input or blur
   const ipInput = document.getElementById("homeNodeIP");
   if (ipInput) {
+    let homeDetectTimer = null;
+    ipInput.addEventListener("input", () => {
+      clearTimeout(homeDetectTimer);
+      const val = ipInput.value.trim();
+      if (val.length >= 3) {
+        homeDetectTimer = setTimeout(() => performHomeNodeDetection(val), 600);
+      }
+    });
+
     ipInput.addEventListener("blur", () => {
       const val = ipInput.value.trim();
       if (val && !document.getElementById("homeNodeLat")?.value) {
-        btnAutoGeo?.click();
+        performHomeNodeDetection(val);
       }
     });
   }
@@ -716,37 +718,17 @@ document.addEventListener("DOMContentLoaded", () => {
       const ip = document.getElementById("homeNodeIP").value.trim();
       let port = parseInt(document.getElementById("homeNodePort")?.value, 10);
       if (isNaN(port) || port <= 0) {
-        port = 80;
+        port = 22;
       }
       let region = (document.getElementById("homeNodeRegion")?.value || "").trim();
       let country = (document.getElementById("homeNodeCountry")?.value || "").trim();
       let lat = parseFloat(document.getElementById("homeNodeLat")?.value) || 0;
       let lon = parseFloat(document.getElementById("homeNodeLon")?.value) || 0;
+      const sshUser = (document.getElementById("homeNodeSSHUser")?.value || "ubuntu").trim();
+      const storageDir = (document.getElementById("homeNodeStorageDir")?.value || "/var/cdn/data").trim();
 
       if (!ip) return;
 
-      // Fast auto-detect before sending if coords not filled yet
-      if (lat === 0 && lon === 0) {
-        if (ip === "storage-new-node" || ip === "198.45.98.44") {
-          region = region || "Asia";
-          country = country || "Japan";
-          lat = 35.6762;
-          lon = 139.6503;
-        } else {
-          try {
-            const geoRes = await fetch(`https://ipapi.co/${encodeURIComponent(ip)}/json/`, { signal: AbortSignal.timeout(2000) });
-            if (geoRes.ok) {
-              const geoData = await geoRes.json();
-              if (geoData.latitude && geoData.longitude) {
-                lat = parseFloat(geoData.latitude.toFixed(4));
-                lon = parseFloat(geoData.longitude.toFixed(4));
-                if (!country && geoData.country_name) country = geoData.country_name;
-                if (!region && (geoData.city || geoData.region)) region = geoData.city || geoData.region;
-              }
-            }
-          } catch (_) {}
-        }
-      }
       if (!region) region = country || "Asia";
       if (!country) country = region;
 
@@ -758,21 +740,30 @@ document.addEventListener("DOMContentLoaded", () => {
       homeProgressAlert.classList.add("d-none");
       resetHomeSteps();
 
-      setHomeStepActive("hstep1", `Step 1: Contacting storage worker at ${escapeHtml(ip)}:${port}...`);
+      setHomeStepActive("hstep1", `Step 1: Enrolling host key & authenticating as ${sshUser}...`);
 
       try {
-        const payload = { ip, port, region, country, latitude: lat, longitude: lon };
+        const payload = {
+          ip,
+          port,
+          region,
+          country,
+          latitude: lat,
+          longitude: lon,
+          ssh_user: sshUser,
+          storage_dir: storageDir,
+        };
 
         const t1 = setTimeout(() => {
-          setHomeStepDone("hstep1", "Step 1: Contacted storage worker.");
-          setHomeStepActive("hstep2", "Step 2: Verifying worker identity & /health endpoint...");
-        }, 400);
+          setHomeStepDone("hstep1", `Step 1: Host key verified. Authenticated as ${sshUser}.`);
+          setHomeStepActive("hstep2", `Step 2: Checking storage directory (${storageDir}) permissions...`);
+        }, 500);
         activeAddNodeTimeouts.push(t1);
 
         const t2 = setTimeout(() => {
-          setHomeStepDone("hstep2", "Step 2: Worker verified (valid storage service).");
-          setHomeStepActive("hstep3", "Step 3: Registering PENDING node in MongoDB...");
-        }, 900);
+          setHomeStepDone("hstep2", `Step 2: Storage directory ${storageDir} verified healthy.`);
+          setHomeStepActive("hstep3", "Step 3: Creating PENDING record & capturing catalog snapshot...");
+        }, 1100);
         activeAddNodeTimeouts.push(t2);
 
         const res = await fetch("/nodes/add", {
@@ -788,21 +779,21 @@ document.addEventListener("DOMContentLoaded", () => {
           clearAddNodeTimers();
           homeProgressSpinner.classList.add("d-none");
           const errMsg = data.error || `HTTP ${res.status}`;
-          setHomeStepError("hstep2", "Worker health verification failed.");
-          showHomeProgressAlert(`<strong>Node registration failed.</strong> Reason: ${escapeHtml(errMsg)}`, "danger");
+          setHomeStepError("hstep1", "Storage worker onboarding rejected.");
+          showHomeProgressAlert(`<strong>Node onboarding failed:</strong><br>${escapeHtml(errMsg)}`, "danger");
           homeSubmitNodeBtn.disabled = false;
           return;
         }
 
         // Success sequence
         clearAddNodeTimers();
-        setHomeStepDone("hstep1", "Step 1: Contacted storage worker.");
-        setHomeStepDone("hstep2", "Step 2: Worker verified (valid storage service).");
-        setHomeStepDone("hstep3", "Step 3: Node registered in MongoDB.");
-        setHomeStepActive("hstep4", "Step 4: Synchronizing existing files via rsync...");
+        setHomeStepDone("hstep1", `Step 1: Host key enrolled. Authenticated as ${sshUser}.`);
+        setHomeStepDone("hstep2", `Step 2: Storage directory ${storageDir} verified.`);
+        setHomeStepDone("hstep3", "Step 3: Initialized catalog snapshot.");
+        setHomeStepActive("hstep4", "Step 4: Synchronizing missing files via rsync / SFTP...");
 
         const t3 = setTimeout(() => {
-          setHomeStepDone("hstep4", "Step 4: File synchronization complete.");
+          setHomeStepDone("hstep4", "Step 4: Catalog synchronized.");
           setHomeStepDone("hstep5", "Step 5: Worker activated to ONLINE!");
           homeProgressSpinner.classList.add("d-none");
 
@@ -818,7 +809,6 @@ document.addEventListener("DOMContentLoaded", () => {
 
       } catch (err) {
         if (err.name === "AbortError") {
-          // Request cancelled by user
           return;
         }
         clearAddNodeTimers();

@@ -161,8 +161,8 @@
               </div>
               <div class="col-12 col-md-2">
                 <label for="homeNodePort" class="form-label small fw-bold mb-1">Port</label>
-                <input type="number" class="form-control form-control-sm" id="homeNodePort" value="80" placeholder="80">
-                <div class="form-text small text-muted mt-1">Default: 80 (Apache) or 8081</div>
+                <input type="number" class="form-control form-control-sm" id="homeNodePort" value="22" placeholder="22">
+                <div class="form-text small text-muted mt-1">Default: 22 (SSH/SFTP)</div>
               </div>
               <div class="col-12 col-md-4 d-flex justify-content-end gap-2 mb-3">
                 <button type="button" class="btn btn-sm btn-danger" id="cancelHomeAddNodeBtn">
@@ -174,13 +174,25 @@
               </div>
             </div>
 
-            <!-- Optional Manual Location Override (Collapsed by default) -->
+            <!-- Optional Manual Location & SSH Override (Collapsed by default) -->
             <div class="mt-2">
               <a class="small text-secondary text-decoration-none" data-bs-toggle="collapse" href="#manualGeoCollapse" role="button" aria-expanded="false" aria-controls="manualGeoCollapse">
-                <i class="bi bi-sliders me-1"></i>Optional: Manual Location & GPS Override
+                <i class="bi bi-sliders me-1"></i>Optional: Manual Location &amp; SSH Parameters Override
               </a>
               <div class="collapse mt-2" id="manualGeoCollapse">
                 <div class="p-3 bg-light border rounded">
+                  <div class="row g-2 mb-2">
+                    <div class="col-12 col-md-6">
+                      <label for="homeNodeSSHUser" class="form-label small fw-bold mb-1">SSH User</label>
+                      <input type="text" class="form-control form-control-sm" id="homeNodeSSHUser" value="ubuntu" placeholder="ubuntu">
+                      <div class="form-text small text-muted">Default for AWS Lightsail is <code>ubuntu</code>.</div>
+                    </div>
+                    <div class="col-12 col-md-6">
+                      <label for="homeNodeStorageDir" class="form-label small fw-bold mb-1">Storage Directory</label>
+                      <input type="text" class="form-control form-control-sm" id="homeNodeStorageDir" value="/var/cdn/data" placeholder="/var/cdn/data">
+                      <div class="form-text small text-muted">Remote folder on storage server.</div>
+                    </div>
+                  </div>
                   <div class="row g-2">
                     <div class="col-12 col-md-3">
                       <label for="homeNodeRegion" class="form-label small fw-bold mb-1">Region</label>
@@ -208,14 +220,14 @@
           <div id="homeProgressBox" class="d-none mt-3 p-3 border rounded bg-light">
             <h6 class="fw-bold mb-2 small text-uppercase text-secondary">
               <span class="spinner-border spinner-border-sm me-1" id="homeProgressSpinner"></span>
-              Onboarding State Machine Progress
+              Onboarding Protocol Progress
             </h6>
             <ul class="list-unstyled mb-0 small" id="homeStepList">
-              <li class="mb-1" id="hstep1"><i class="bi bi-circle text-muted me-2"></i>Step 1: Contacting storage worker health endpoint...</li>
-              <li class="mb-1" id="hstep2"><i class="bi bi-circle text-muted me-2"></i>Step 2: Verifying worker identity & status...</li>
-              <li class="mb-1" id="hstep3"><i class="bi bi-circle text-muted me-2"></i>Step 3: Registering node as PENDING in MongoDB...</li>
-              <li class="mb-1" id="hstep4"><i class="bi bi-circle text-muted me-2"></i>Step 4: Synchronizing existing files via rsync...</li>
-              <li class="mb-0" id="hstep5"><i class="bi bi-circle text-muted me-2"></i>Step 5: Activating worker node to ONLINE.</li>
+              <li class="mb-1" id="hstep1"><i class="bi bi-circle text-muted me-2"></i>Step 1: Host-key auto-enrollment &amp; SSH authentication probe...</li>
+              <li class="mb-1" id="hstep2"><i class="bi bi-circle text-muted me-2"></i>Step 2: Checking storage directory (/var/cdn/data) permissions...</li>
+              <li class="mb-1" id="hstep3"><i class="bi bi-circle text-muted me-2"></i>Step 3: Registering node as PENDING &amp; capturing catalog snapshot...</li>
+              <li class="mb-1" id="hstep4"><i class="bi bi-circle text-muted me-2"></i>Step 4: Synchronizing missing files via rsync / SFTP...</li>
+              <li class="mb-0" id="hstep5"><i class="bi bi-circle text-muted me-2"></i>Step 5: Mutation barrier audit &amp; node activation to ONLINE!</li>
             </ul>
             <div id="homeProgressAlert" class="alert d-none mt-2 mb-0 small" role="alert"></div>
           </div>
