@@ -33,6 +33,10 @@ func newTestStorageClient() *testStorageClient {
 	}
 }
 
+func (c *testStorageClient) AutoEnrollHostKey(ctx context.Context, host string, port int) error {
+	return nil
+}
+
 func (c *testStorageClient) Upload(ctx context.Context, host string, port int, fileID string, localFilePath string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()

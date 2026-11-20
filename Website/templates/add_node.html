@@ -76,9 +76,19 @@
             <div class="input-group">
               <span class="input-group-text bg-light"><i class="bi bi-hdd-network"></i></span>
               <input type="text" class="form-control" id="nodeIP" placeholder="e.g. 18.219.221.233 or storage-lon" required autofocus>
+              <button class="btn btn-outline-secondary" type="button" id="detectBtn">
+                <i class="bi bi-magic me-1"></i>Detect
+              </button>
+            </div>
+            <div id="detectionStatus" class="mt-2 d-none">
+              <div class="alert alert-info py-2 px-3 mb-0 small d-flex align-items-center gap-2" id="detectionAlert">
+                <span class="spinner-border spinner-border-sm text-primary" id="detectSpinner"></span>
+                <i class="bi bi-check-circle-fill text-success fs-6 d-none" id="detectSuccessIcon"></i>
+                <div id="detectMessage">Auto-detecting server geolocation &amp; SSH parameters...</div>
+              </div>
             </div>
             <div class="form-text small">
-              Host key fingerprint must be registered in Central API's known_hosts. Dedicated user <code>cdn-sync</code> and <code>/var/cdn/data</code> must be prepared.
+              Geolocation, SSH port (22), username (<code>ubuntu</code>), storage directory (<code>/var/cdn/data</code>), and SSH host keys are auto-detected and enrolled on first contact.
             </div>
           </div>
 
@@ -87,7 +97,7 @@
             <div class="accordion-item border-light-subtle">
               <h2 class="accordion-header" id="headingAdv">
                 <button class="accordion-button collapsed py-2 px-3 small bg-light" type="button" data-bs-toggle="collapse" data-bs-target="#collapseAdv">
-                  <i class="bi bi-sliders me-2"></i>Optional Geographic &amp; Port Overrides (Auto-detected if blank)
+                  <i class="bi bi-sliders me-2"></i>Advanced Configuration &amp; Overrides (Auto-filled on detection)
                 </button>
               </h2>
               <div id="collapseAdv" class="accordion-collapse collapse" data-bs-parent="#advancedAccordion">
@@ -98,10 +108,18 @@
                       <input type="number" class="form-control form-control-sm" id="nodePort" value="22">
                     </div>
                     <div class="col-12 col-md-4">
+                      <label for="nodeSSHUser" class="form-label small fw-bold">SSH User</label>
+                      <input type="text" class="form-control form-control-sm" id="nodeSSHUser" value="ubuntu" placeholder="ubuntu">
+                    </div>
+                    <div class="col-12 col-md-4">
+                      <label for="nodeStorageDir" class="form-label small fw-bold">Storage Directory</label>
+                      <input type="text" class="form-control form-control-sm" id="nodeStorageDir" value="/var/cdn/data" placeholder="/var/cdn/data">
+                    </div>
+                    <div class="col-12 col-md-6">
                       <label for="nodeRegion" class="form-label small fw-bold">Region</label>
                       <input type="text" class="form-control form-control-sm" id="nodeRegion" placeholder="Auto-detected">
                     </div>
-                    <div class="col-12 col-md-4">
+                    <div class="col-12 col-md-6">
                       <label for="nodeCountry" class="form-label small fw-bold">Country</label>
                       <input type="text" class="form-control form-control-sm" id="nodeCountry" placeholder="Auto-detected">
                     </div>
@@ -138,11 +156,11 @@
           </h6>
 
           <ul class="list-unstyled mb-0 small" id="stepList">
-            <li class="mb-2" id="step1"><i class="bi bi-circle text-muted me-2"></i>Step 1: Strict SSH host-key verification &amp; health probe...</li>
+            <li class="mb-2" id="step1"><i class="bi bi-circle text-muted me-2"></i>Step 1: Host-key auto-enrollment &amp; SSH authentication probe...</li>
             <li class="mb-2" id="step2"><i class="bi bi-circle text-muted me-2"></i>Step 2: Checking storage directory (/var/cdn/data) permissions...</li>
-            <li class="mb-2" id="step3"><i class="bi bi-circle text-muted me-2"></i>Step 3: Registering node as PENDING &amp; capturing sync snapshot...</li>
-            <li class="mb-2" id="step4"><i class="bi bi-circle text-muted me-2"></i>Step 4: rsync catalog transfer &amp; mutation journal replay...</li>
-            <li class="mb-0" id="step5"><i class="bi bi-circle text-muted me-2"></i>Step 5: Mutation barrier audit &amp; activation to ONLINE!</li>
+            <li class="mb-2" id="step3"><i class="bi bi-circle text-muted me-2"></i>Step 3: Registering node as PENDING &amp; capturing catalog snapshot...</li>
+            <li class="mb-2" id="step4"><i class="bi bi-circle text-muted me-2"></i>Step 4: Synchronizing missing files via rsync / SFTP...</li>
+            <li class="mb-0" id="step5"><i class="bi bi-circle text-muted me-2"></i>Step 5: Mutation barrier audit &amp; node activation to ONLINE!</li>
           </ul>
 
           <div id="progressAlert" class="alert d-none mt-3 mb-0 small" role="alert"></div>

@@ -28,6 +28,9 @@ var (
 )
 
 type StorageClient interface {
+	// AutoEnrollHostKey discovers and registers a remote host key into known_hosts (Trust On First Use).
+	AutoEnrollHostKey(ctx context.Context, host string, port int) error
+
 	// Upload copies a local staged file to the remote storage server using rsync over SSH.
 	Upload(ctx context.Context, host string, port int, fileID string, localFilePath string) error
 
@@ -59,7 +62,7 @@ type SSHStorageClient struct {
 
 func NewSSHStorageClient(keyPath, knownHostsPath, sshUser, remoteDataDir string) (*SSHStorageClient, error) {
 	if sshUser == "" {
-		sshUser = "cdn-sync"
+		sshUser = "ubuntu"
 	}
 	if remoteDataDir == "" {
 		remoteDataDir = "/var/cdn/data"
@@ -75,8 +78,17 @@ func NewSSHStorageClient(keyPath, knownHostsPath, sshUser, remoteDataDir string)
 		return nil, fmt.Errorf("failed to parse SSH private key: %w", err)
 	}
 
+	// Ensure known_hosts file and its parent directory exist (auto-create if missing)
 	if _, err := os.Stat(knownHostsPath); os.IsNotExist(err) {
-		return nil, fmt.Errorf("known_hosts file does not exist at %s: %w", knownHostsPath, err)
+		dir := filepath.Dir(knownHostsPath)
+		if dir != "" && dir != "." {
+			if mkErr := os.MkdirAll(dir, 0700); mkErr != nil {
+				return nil, fmt.Errorf("failed to create directory for known_hosts at %s: %w", knownHostsPath, mkErr)
+			}
+		}
+		if writeErr := os.WriteFile(knownHostsPath, []byte(""), 0600); writeErr != nil {
+			return nil, fmt.Errorf("failed to create known_hosts file at %s: %w", knownHostsPath, writeErr)
+		}
 	}
 
 	hostCallback, err := knownhosts.New(knownHostsPath)
@@ -94,18 +106,111 @@ func NewSSHStorageClient(keyPath, knownHostsPath, sshUser, remoteDataDir string)
 	}, nil
 }
 
-func (c *SSHStorageClient) getClientConfig(timeout time.Duration) *ssh.ClientConfig {
+func (c *SSHStorageClient) getClientConfigForUser(user string, timeout time.Duration) *ssh.ClientConfig {
 	if timeout <= 0 {
 		timeout = 10 * time.Second
 	}
+	c.mu.RLock()
+	cb := c.hostCallback
+	c.mu.RUnlock()
+
 	return &ssh.ClientConfig{
+		User: user,
+		Auth: []ssh.AuthMethod{
+			ssh.PublicKeys(c.signer),
+		},
+		HostKeyCallback: cb, // STRICT Host-Key Verification
+		Timeout:         timeout,
+	}
+}
+
+func (c *SSHStorageClient) getClientConfig(timeout time.Duration) *ssh.ClientConfig {
+	return c.getClientConfigForUser(c.sshUser, timeout)
+}
+
+// AutoEnrollHostKey contacts host:port, captures the remote host's public key,
+// and securely registers it into known_hosts if not already enrolled (Trust On First Use).
+func (c *SSHStorageClient) AutoEnrollHostKey(ctx context.Context, host string, port int) error {
+	if port <= 0 {
+		port = 22
+	}
+	addr := net.JoinHostPort(host, strconv.Itoa(port))
+
+	var capturedKey ssh.PublicKey
+	probeConfig := &ssh.ClientConfig{
 		User: c.sshUser,
 		Auth: []ssh.AuthMethod{
 			ssh.PublicKeys(c.signer),
 		},
-		HostKeyCallback: c.hostCallback, // STRICT Host-Key Verification
-		Timeout:         timeout,
+		HostKeyCallback: func(hostname string, remote net.Addr, key ssh.PublicKey) error {
+			capturedKey = key
+			return nil // Accept key during discovery probe to capture it
+		},
+		Timeout: 5 * time.Second,
 	}
+
+	var d net.Dialer
+	conn, err := d.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return fmt.Errorf("%w: cannot reach %s for host-key enrollment: %v", ErrStorageUnavail, addr, err)
+	}
+	defer conn.Close()
+
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = conn.SetDeadline(deadline)
+	} else {
+		_ = conn.SetDeadline(time.Now().Add(probeConfig.Timeout))
+	}
+
+	// Trigger SSH handshake to execute HostKeyCallback and capture host key
+	sshConn, chans, reqs, _ := ssh.NewClientConn(conn, addr, probeConfig)
+	if sshConn != nil {
+		_ = sshConn.Close()
+	}
+	_ = chans
+	_ = reqs
+
+	if capturedKey == nil {
+		return fmt.Errorf("failed to retrieve host key from %s", addr)
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// If hostCallback is available, check if this host and key are already known
+	if c.hostCallback != nil {
+		remoteAddr, _ := net.ResolveTCPAddr("tcp", addr)
+		if remoteAddr == nil {
+			remoteAddr = &net.TCPAddr{IP: net.ParseIP(host), Port: port}
+		}
+		if checkErr := c.hostCallback(addr, remoteAddr, capturedKey); checkErr == nil {
+			// Already enrolled and valid
+			return nil
+		}
+	}
+
+	// Prepare known_hosts entry
+	line := knownhosts.Line([]string{knownhosts.Normalize(addr), knownhosts.Normalize(host)}, capturedKey) + "\n"
+
+	f, err := os.OpenFile(c.knownHostsPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		return fmt.Errorf("failed to open known_hosts at %s for writing: %w", c.knownHostsPath, err)
+	}
+	if _, err := f.WriteString(line); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("failed to write host key to %s: %w", c.knownHostsPath, err)
+	}
+	_ = f.Close()
+
+	// Reload knownhosts callback with the new host entry
+	newCb, err := knownhosts.New(c.knownHostsPath)
+	if err != nil {
+		return fmt.Errorf("failed to reload known_hosts from %s: %w", c.knownHostsPath, err)
+	}
+	c.hostCallback = newCb
+
+	log.Printf("[SSH-CLIENT] Successfully enrolled host key for %s into %s (Trust On First Use)", addr, c.knownHostsPath)
+	return nil
 }
 
 // DialSSH establishes an SSH connection with strict host-key verification.
@@ -113,21 +218,19 @@ func (c *SSHStorageClient) DialSSH(ctx context.Context, host string, port int) (
 	return c.dialSSH(ctx, host, port)
 }
 
-func (c *SSHStorageClient) dialSSH(ctx context.Context, host string, port int) (*ssh.Client, error) {
+func (c *SSHStorageClient) dialSSHWithUser(ctx context.Context, host string, port int, user string) (*ssh.Client, error) {
 	if port <= 0 {
 		port = 22
 	}
 	addr := net.JoinHostPort(host, strconv.Itoa(port))
-	cfg := c.getClientConfig(10 * time.Second)
+	cfg := c.getClientConfigForUser(user, 10*time.Second)
 
-	// Dial using timeout context
 	var d net.Dialer
 	conn, err := d.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return nil, fmt.Errorf("%w: dial %s failed: %v", ErrStorageUnavail, addr, err)
 	}
 
-	// Set deadline for SSH handshake
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = conn.SetDeadline(deadline)
 	} else {
@@ -140,13 +243,27 @@ func (c *SSHStorageClient) dialSSH(ctx context.Context, host string, port int) (
 		if strings.Contains(err.Error(), "knownhosts: key is unknown") || strings.Contains(err.Error(), "host key mismatch") {
 			return nil, fmt.Errorf("%w for %s: %v", ErrHostUntrusted, addr, err)
 		}
-		return nil, fmt.Errorf("ssh connection handshake failed to %s: %w", addr, err)
+		return nil, fmt.Errorf("ssh connection handshake failed for user %s to %s: %w", user, addr, err)
 	}
 
-	// Reset connection deadline after successful handshake
 	_ = conn.SetDeadline(time.Time{})
-
 	return ssh.NewClient(sshConn, chans, reqs), nil
+}
+
+func (c *SSHStorageClient) dialSSH(ctx context.Context, host string, port int) (*ssh.Client, error) {
+	client, err := c.dialSSHWithUser(ctx, host, port, c.sshUser)
+	if err != nil && strings.Contains(err.Error(), "unable to authenticate") {
+		// Multi-user fallback: AWS default is ubuntu, custom CDN user is cdn-sync
+		altUser := "ubuntu"
+		if c.sshUser == "ubuntu" {
+			altUser = "cdn-sync"
+		}
+		log.Printf("[SSH] Authentication failed as user %q on %s:%d. Retrying with fallback user %q...", c.sshUser, host, port, altUser)
+		if altClient, altErr := c.dialSSHWithUser(ctx, host, port, altUser); altErr == nil {
+			return altClient, nil
+		}
+	}
+	return client, err
 }
 
 // Upload sends a file to remote /var/cdn/data/<fileID> using rsync over SSH.
@@ -196,6 +313,9 @@ func (c *SSHStorageClient) sftpUploadAtomic(ctx context.Context, host string, po
 		return fmt.Errorf("failed to create sftp client: %w", err)
 	}
 	defer sftpClient.Close()
+
+	// Ensure remote directory exists
+	_ = sftpClient.MkdirAll(c.remoteDataDir)
 
 	srcFile, err := os.Open(localFilePath)
 	if err != nil {
@@ -337,11 +457,27 @@ func (c *SSHStorageClient) Health(ctx context.Context, host string, port int) (b
 
 	stat, err := sftpClient.Stat(c.remoteDataDir)
 	if err != nil {
-		return false, fmt.Errorf("storage directory %s inaccessible: %w", c.remoteDataDir, err)
+		// Attempt to auto-create directory if possible
+		if mkErr := sftpClient.MkdirAll(c.remoteDataDir); mkErr == nil {
+			stat, err = sftpClient.Stat(c.remoteDataDir)
+		}
+	}
+	if err != nil {
+		return false, fmt.Errorf("storage directory %s inaccessible (run 'sudo mkdir -p %s && sudo chown -R %s:%s %s'): %w",
+			c.remoteDataDir, c.remoteDataDir, c.sshUser, c.sshUser, c.remoteDataDir, err)
 	}
 	if !stat.IsDir() {
 		return false, fmt.Errorf("storage path %s is not a directory", c.remoteDataDir)
 	}
+
+	// Verify write permission with a lightweight probe file
+	probeFile := fmt.Sprintf("%s/.probe_%d", c.remoteDataDir, time.Now().UnixNano())
+	f, err := sftpClient.Create(probeFile)
+	if err != nil {
+		return false, fmt.Errorf("storage directory %s not writable (permission denied): %w", c.remoteDataDir, err)
+	}
+	_ = f.Close()
+	_ = sftpClient.Remove(probeFile)
 
 	return true, nil
 }

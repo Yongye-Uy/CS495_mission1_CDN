@@ -73,7 +73,7 @@ func Load() *Config {
 		}
 	}
 
-	sshUser := getEnv("SSH_USER", "cdn-sync")
+	sshUser := getEnv("SSH_USER", "ubuntu")
 	storageDataDir := getEnv("STORAGE_DATA_DIR", "/var/cdn/data")
 	stagingDir := getEnv("STAGING_DIR", "")
 	if stagingDir == "" {

@@ -3,6 +3,7 @@ package handlers
 import (
 	"errors"
 	"net/http"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 
@@ -21,12 +22,40 @@ func NewNodeHandler(nodeService *services.NodeService) *NodeHandler {
 }
 
 type OnboardNodeRequest struct {
-	IP        string  `json:"ip" binding:"required"`
-	Port      int     `json:"port"`
-	Region    string  `json:"region"`
-	Country   string  `json:"country"`
-	Latitude  float64 `json:"latitude"`
-	Longitude float64 `json:"longitude"`
+	IP         string  `json:"ip" binding:"required"`
+	Port       int     `json:"port"`
+	Region     string  `json:"region"`
+	Country    string  `json:"country"`
+	Latitude   float64 `json:"latitude"`
+	Longitude  float64 `json:"longitude"`
+	SSHUser    string  `json:"ssh_user"`
+	StorageDir string  `json:"storage_dir"`
+}
+
+// DetectNode handles GET /api/nodes/detect?ip=<ip>
+func (h *NodeHandler) DetectNode(c *gin.Context) {
+	ip := strings.TrimSpace(c.Query("ip"))
+	if ip == "" {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"error":   "Query parameter 'ip' is required",
+		})
+		return
+	}
+
+	info, err := h.nodeService.DetectNodeInfo(c.Request.Context(), ip)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"success": false,
+			"error":   err.Error(),
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data":    info,
+	})
 }
 
 // ListNodes handles GET /api/nodes
@@ -59,12 +88,14 @@ func (h *NodeHandler) OnboardNode(c *gin.Context) {
 	}
 
 	params := services.RegisterNodeParams{
-		IP:        req.IP,
-		Port:      req.Port,
-		Region:    req.Region,
-		Country:   req.Country,
-		Latitude:  req.Latitude,
-		Longitude: req.Longitude,
+		IP:         req.IP,
+		Port:       req.Port,
+		Region:     req.Region,
+		Country:    req.Country,
+		Latitude:   req.Latitude,
+		Longitude:  req.Longitude,
+		SSHUser:    req.SSHUser,
+		StorageDir: req.StorageDir,
 	}
 
 	node, err := h.nodeService.OnboardNode(c.Request.Context(), params)

@@ -104,6 +104,7 @@ func main() {
 	apiNodes := r.Group("/api/nodes")
 	{
 		apiNodes.GET("", nodeHandler.ListNodes)
+		apiNodes.GET("/detect", nodeHandler.DetectNode)
 		apiNodes.GET("/:id", nodeHandler.GetNode)
 		apiNodes.GET("/:id/health", nodeHandler.CheckNodeHealth)
 

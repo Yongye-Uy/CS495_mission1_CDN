@@ -42,6 +42,9 @@ func (s *SyncService) OnboardAndSynchronize(ctx context.Context, targetNode *mod
 	if targetNode == nil {
 		return fmt.Errorf("target storage node is nil")
 	}
+	if s.storageClient == nil {
+		return fmt.Errorf("SSH storage client is uninitialized on Central API server")
+	}
 
 	port := targetNode.Port
 	if port <= 0 {

@@ -43,6 +43,10 @@ func (m *MockStorageClient) SetNodeFailing(host string, port int, failing bool) 
 	m.failingNodes[m.key(host, port)] = failing
 }
 
+func (m *MockStorageClient) AutoEnrollHostKey(ctx context.Context, host string, port int) error {
+	return nil
+}
+
 func (m *MockStorageClient) Upload(ctx context.Context, host string, port int, fileID string, localFilePath string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

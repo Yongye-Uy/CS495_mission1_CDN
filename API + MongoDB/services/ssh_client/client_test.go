@@ -55,11 +55,24 @@ func TestNewSSHStorageClient_Validation(t *testing.T) {
 		}
 	})
 
-	t.Run("missing known_hosts returns error", func(t *testing.T) {
+	t.Run("missing known_hosts is auto-created", func(t *testing.T) {
 		keyPath, _ := generateTestEd25519Key(t)
-		_, err := NewSSHStorageClient(keyPath, "/non/existent/hosts", "cdn-sync", "/var/cdn/data")
-		if err == nil {
-			t.Errorf("expected error for missing known_hosts, got nil")
+		tmpDir, err := os.MkdirTemp("", "known_hosts_dir_*")
+		if err != nil {
+			t.Fatalf("failed to create temp dir: %v", err)
+		}
+		defer os.RemoveAll(tmpDir)
+
+		nonExistentFile := tmpDir + "/cdn_known_hosts"
+		client, err := NewSSHStorageClient(keyPath, nonExistentFile, "ubuntu", "/var/cdn/data")
+		if err != nil {
+			t.Fatalf("expected auto-creation of missing known_hosts, got error: %v", err)
+		}
+		if client == nil {
+			t.Errorf("expected non-nil client")
+		}
+		if _, err := os.Stat(nonExistentFile); os.IsNotExist(err) {
+			t.Errorf("expected file %s to be auto-created", nonExistentFile)
 		}
 	})
 }
@@ -174,6 +187,35 @@ func TestStrictHostKeyVerification(t *testing.T) {
 		conn, err := client.DialSSH(ctx, "127.0.0.1", port)
 		if err != nil {
 			t.Fatalf("expected successful SSH connection for registered host, got err: %v", err)
+		}
+		defer conn.Close()
+	})
+
+	t.Run("auto-enrolls unknown host and subsequent connection succeeds", func(t *testing.T) {
+		tmpKnownHosts, err := os.CreateTemp("", "known_hosts_auto_*")
+		if err != nil {
+			t.Fatalf("failed to create temp known_hosts: %v", err)
+		}
+		defer os.Remove(tmpKnownHosts.Name())
+		tmpKnownHosts.Close()
+
+		client, err := NewSSHStorageClient(clientKeyPath, tmpKnownHosts.Name(), "ubuntu", "/tmp")
+		if err != nil {
+			t.Fatalf("failed to create SSH storage client: %v", err)
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+
+		// Proactively auto-enroll host key
+		if err := client.AutoEnrollHostKey(ctx, "127.0.0.1", port); err != nil {
+			t.Fatalf("AutoEnrollHostKey failed: %v", err)
+		}
+
+		// Subsequent connection must now succeed!
+		conn, err := client.DialSSH(ctx, "127.0.0.1", port)
+		if err != nil {
+			t.Fatalf("expected successful SSH connection after AutoEnrollHostKey, got: %v", err)
 		}
 		defer conn.Close()
 	})

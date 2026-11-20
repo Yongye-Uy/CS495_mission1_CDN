@@ -53,6 +53,10 @@ func (w *mockSSHStorageWorker) SetNodeFailing(host string, port int, failing boo
 	w.failingNodes[k] = failing
 }
 
+func (w *mockSSHStorageWorker) AutoEnrollHostKey(ctx context.Context, host string, port int) error {
+	return nil
+}
+
 func (w *mockSSHStorageWorker) Upload(ctx context.Context, host string, port int, fileID string, localFilePath string) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()

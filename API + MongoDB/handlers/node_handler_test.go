@@ -19,6 +19,10 @@ import (
 
 type dummyStorageClient struct{}
 
+func (d *dummyStorageClient) AutoEnrollHostKey(ctx context.Context, host string, port int) error {
+	return nil
+}
+
 func (d *dummyStorageClient) Upload(ctx context.Context, host string, port int, fileID string, localFilePath string) error {
 	return nil
 }
