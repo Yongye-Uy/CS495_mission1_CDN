@@ -1,54 +1,73 @@
 package services
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"log"
-	"math"
 	"mime"
 	"net/http"
+	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"go.mongodb.org/mongo-driver/mongo"
+
 	"mini-cdn/api/models"
 	"mini-cdn/api/repository"
+	"mini-cdn/api/services/barrier"
 	"mini-cdn/api/services/geo"
-	"mini-cdn/api/services/storage_client"
+	"mini-cdn/api/services/ssh_client"
 )
 
 var (
 	ErrAllReplicasFailed = errors.New("failed to replicate file to any storage node")
 	ErrNoAvailableServer = errors.New("no healthy storage node available to serve the file")
+	ErrQuorumNotMet      = errors.New("quorum not met (fewer than 2 replicas available)")
 )
 
 type FileService struct {
 	repo          repository.FileRepository
 	nodeRepo      repository.NodeRepository
-	storageClient storage_client.StorageClient
+	journalRepo   repository.JournalRepository
+	storageClient ssh_client.StorageClient
 	geoService    *geo.GeoService
+	barrier       *barrier.MutationBarrier
+	stagingDir    string
 	storageNodes  []models.Replica
 }
 
 func NewFileService(
 	repo repository.FileRepository,
 	nodeRepo repository.NodeRepository,
-	storageClient storage_client.StorageClient,
+	journalRepo repository.JournalRepository,
+	storageClient ssh_client.StorageClient,
 	geoService *geo.GeoService,
+	barrier *barrier.MutationBarrier,
+	stagingDir string,
 	storageNodes []models.Replica,
 ) *FileService {
+	if stagingDir == "" {
+		stagingDir = filepath.Join(os.TempDir(), "mission1_staging")
+	}
+	_ = os.MkdirAll(stagingDir, 0700)
+
 	return &FileService{
 		repo:          repo,
 		nodeRepo:      nodeRepo,
+		journalRepo:   journalRepo,
 		storageClient: storageClient,
 		geoService:    geoService,
+		barrier:       barrier,
+		stagingDir:    stagingDir,
 		storageNodes:  storageNodes,
 	}
 }
@@ -60,36 +79,61 @@ func GenerateSafeFileID() string {
 	return fmt.Sprintf("f_%d_%s", time.Now().Unix(), hex.EncodeToString(b))
 }
 
-// getActiveReplicationTargets gets active storage nodes dynamically from NodeRepository.
-// If none are registered, falls back to default configured storageNodes.
-func (s *FileService) getActiveReplicationTargets(ctx context.Context) []models.Replica {
+type targetNode struct {
+	nodeID   string
+	ip       string
+	port     int
+	location string
+}
+
+// getActiveStorageNodes resolves the active online nodes from NodeRepository.
+func (s *FileService) getActiveStorageNodes(ctx context.Context) []targetNode {
 	if s.nodeRepo != nil {
 		onlineNodes, err := s.nodeRepo.FindOnline(ctx)
 		if err == nil && len(onlineNodes) > 0 {
-			var targets []models.Replica
+			var targets []targetNode
 			for _, n := range onlineNodes {
-				name := n.Region
-				if name == "" || strings.ToLower(name) == "local" {
-					name = "singapore"
+				port := n.Port
+				if port <= 0 {
+					port = 22
 				}
-				targets = append(targets, models.Replica{
-					Location: strings.ToLower(name),
-					URL:      n.BaseURL(),
+				loc := n.Region
+				if loc == "" {
+					loc = n.Country
+				}
+				if loc == "" {
+					loc = "storage"
+				}
+				targets = append(targets, targetNode{
+					nodeID:   n.NodeID,
+					ip:       n.IP,
+					port:     port,
+					location: strings.ToLower(loc),
 				})
 			}
 			return targets
 		}
 	}
 
-	var targets []models.Replica
-	for _, n := range s.storageNodes {
-		loc := n.Location
-		if loc == "" || strings.ToLower(loc) == "local" {
-			loc = "singapore"
+	// Fallback to configured storage nodes
+	var targets []targetNode
+	for i, n := range s.storageNodes {
+		host := n.URL
+		port := 22
+		cleanHost := strings.TrimPrefix(strings.TrimPrefix(host, "http://"), "https://")
+		if strings.Contains(cleanHost, ":") {
+			parts := strings.Split(cleanHost, ":")
+			cleanHost = parts[0]
+			if p, err := strconv.Atoi(parts[1]); err == nil {
+				port = p
+			}
 		}
-		targets = append(targets, models.Replica{
-			Location: strings.ToLower(loc),
-			URL:      n.URL,
+		nodeID := fmt.Sprintf("node-%s-%d", n.Location, i+1)
+		targets = append(targets, targetNode{
+			nodeID:   nodeID,
+			ip:       cleanHost,
+			port:     port,
+			location: strings.ToLower(n.Location),
 		})
 	}
 	return targets
@@ -99,7 +143,8 @@ func (s *FileService) ResolveClientLocation(r *http.Request) geo.ClientLocation 
 	return s.geoService.ResolveClientLocation(r)
 }
 
-// Upload handles receiving a file, replicating across storage nodes, and persisting metadata.
+// Upload receives a stream, saves it to staging disk, records an atomic journal mutation,
+// replicates across active storage nodes, enforces 3/3 replication for COMPLETE, and retains staging if partial.
 func (s *FileService) Upload(
 	ctx context.Context,
 	filename string,
@@ -107,10 +152,13 @@ func (s *FileService) Upload(
 	fileReader io.Reader,
 	fileSize int64,
 ) (*models.FileMetadata, *models.ReplicationStatus, error) {
-	fileID := GenerateSafeFileID()
-	log.Printf("[API] Upload started: file=%s, generatedId=%s, size=%d bytes", filename, fileID, fileSize)
+	// 1. Acquire Mutation Barrier Read Lock
+	s.barrier.RLock()
+	defer s.barrier.RUnlock()
 
-	// Clean filename and infer content type if generic
+	fileID := GenerateSafeFileID()
+	log.Printf("[API] Upload initiated: file=%s, fileId=%s", filename, fileID)
+
 	filename = filepath.Base(filename)
 	if contentType == "" || contentType == "application/octet-stream" {
 		ext := filepath.Ext(filename)
@@ -121,303 +169,384 @@ func (s *FileService) Upload(
 		}
 	}
 
-	// Read file into memory buffer to allow concurrent replication across nodes
-	var fileBuffer bytes.Buffer
-	actualSize, err := io.Copy(&fileBuffer, fileReader)
+	// 2. Stream to durable local staging file while computing SHA-256
+	stagedPath := filepath.Join(s.stagingDir, fileID)
+	stageFile, err := os.OpenFile(stagedPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to buffer file stream: %w", err)
+		return nil, nil, fmt.Errorf("failed to create staging file at %s: %w", stagedPath, err)
+	}
+
+	hasher := sha256.New()
+	mw := io.MultiWriter(stageFile, hasher)
+
+	actualSize, copyErr := io.Copy(mw, fileReader)
+	closeErr := stageFile.Close()
+	if copyErr != nil {
+		_ = os.Remove(stagedPath)
+		return nil, nil, fmt.Errorf("failed to write staging file: %w", copyErr)
+	}
+	if closeErr != nil {
+		_ = os.Remove(stagedPath)
+		return nil, nil, fmt.Errorf("failed to close staging file: %w", closeErr)
 	}
 	if actualSize == 0 {
+		_ = os.Remove(stagedPath)
 		return nil, nil, errors.New("cannot upload empty file")
 	}
 
-	rawBytes := fileBuffer.Bytes()
+	sha256Hex := hex.EncodeToString(hasher.Sum(nil))
 
-	// Discover targets dynamically
-	targets := s.getActiveReplicationTargets(ctx)
-	if len(targets) == 0 {
-		return nil, nil, errors.New("no online storage nodes available for replication")
+	// 3. Atomically commit file metadata and mutation journal entry via MongoDB transaction
+	fileMeta := &models.FileMetadata{
+		ID:                fileID,
+		OriginalName:      filename,
+		ContentType:       contentType,
+		Size:              actualSize,
+		SHA256:            sha256Hex,
+		CreatedAt:         time.Now().UTC(),
+		UpdatedAt:         time.Now().UTC(),
+		ReplicationStatus: models.ReplicationStatusPending,
+		QuorumMet:         false,
+		Replicas:          []models.Replica{},
+		StagedPath:        stagedPath,
+		RetryCount:        0,
+		IsDeleted:         false,
 	}
 
-	var wg sync.WaitGroup
+	mongoClient := s.repo.Client()
+	if mongoClient != nil {
+		session, err := mongoClient.StartSession()
+		if err == nil {
+			defer session.EndSession(ctx)
+			_, txErr := session.WithTransaction(ctx, func(sc mongo.SessionContext) (interface{}, error) {
+				return s.journalRepo.RecordMutationTx(ctx, sc, models.OpUpload, fileID, filename, actualSize, sha256Hex, fileMeta)
+			})
+			if txErr != nil {
+				log.Printf("[API] Transaction error on upload: %v. Fallback to direct insertion.", txErr)
+				_ = s.repo.Create(ctx, fileMeta)
+				seq, _ := s.journalRepo.NextSequence(ctx)
+				_ = s.journalRepo.InsertEntry(ctx, &models.MutationJournalEntry{
+					Seq:       seq,
+					Op:        models.OpUpload,
+					FileID:    fileID,
+					Filename:  filename,
+					Size:      actualSize,
+					SHA256:    sha256Hex,
+					CreatedAt: time.Now(),
+				})
+			}
+		} else {
+			_ = s.repo.Create(ctx, fileMeta)
+		}
+	} else {
+		// In-memory or standalone test fallback
+		_ = s.repo.Create(ctx, fileMeta)
+		seq, _ := s.journalRepo.NextSequence(ctx)
+		_ = s.journalRepo.InsertEntry(ctx, &models.MutationJournalEntry{
+			Seq:       seq,
+			Op:        models.OpUpload,
+			FileID:    fileID,
+			Filename:  filename,
+			Size:      actualSize,
+			SHA256:    sha256Hex,
+			CreatedAt: time.Now(),
+		})
+	}
+
+	// 4. Discover active replication targets
+	targets := s.getActiveStorageNodes(ctx)
+	if len(targets) == 0 {
+		log.Printf("[API] Warning: no active storage nodes registered. File %s kept in staging.", fileID)
+		repStatus := &models.ReplicationStatus{
+			Success:            false,
+			Message:            "File staged locally on API disk; zero storage nodes currently online.",
+			SuccessfulReplicas: []string{},
+			FailedReplicas:     []string{"all"},
+		}
+		return fileMeta, repStatus, nil
+	}
+
+	// 5. Parallel rsync replication over SSH to all active nodes
 	type repResult struct {
-		replica models.Replica
-		err     error
+		target targetNode
+		err    error
 	}
 
 	resultChan := make(chan repResult, len(targets))
+	var wg sync.WaitGroup
 
-	// Replicate to each active storage node
-	for _, node := range targets {
+	for _, t := range targets {
 		wg.Add(1)
-		go func(target models.Replica) {
+		go func(node targetNode) {
 			defer wg.Done()
-			uploadReader := bytes.NewReader(rawBytes)
-			uploadErr := s.storageClient.Upload(ctx, target.URL, fileID, filename, uploadReader)
-			if uploadErr != nil {
-				log.Printf("[API] Storage upload FAILED location=%s url=%s error=%v", target.Location, target.URL, uploadErr)
+			repErr := s.storageClient.Upload(ctx, node.ip, node.port, fileID, stagedPath)
+			if repErr != nil {
+				log.Printf("[API] Replication to %s (%s:%d) FAILED: %v", node.nodeID, node.ip, node.port, repErr)
 			} else {
-				log.Printf("[API] Storage upload SUCCESSFUL location=%s url=%s", target.Location, target.URL)
+				log.Printf("[API] Replication to %s (%s:%d) SUCCESSFUL", node.nodeID, node.ip, node.port)
 			}
-			resultChan <- repResult{replica: target, err: uploadErr}
-		}(node)
+			resultChan <- repResult{target: node, err: repErr}
+		}(t)
 	}
 
 	wg.Wait()
 	close(resultChan)
 
 	var successfulNodes []models.Replica
-	var successfulLocations []string
-	var failedLocations []string
+	var successfulNames []string
+	var failedNames []string
 
-	for res := range resultChan {
-		if res.err == nil {
-			successfulNodes = append(successfulNodes, res.replica)
+	for r := range resultChan {
+		if r.err == nil {
+			successfulNodes = append(successfulNodes, models.Replica{
+				Location: r.target.location,
+				URL:      r.target.nodeID,
+			})
+			successfulNames = append(successfulNames, r.target.nodeID)
 		} else {
-			failedLocations = append(failedLocations, res.replica.Location)
+			failedNames = append(failedNames, r.target.nodeID)
 		}
 	}
 
-	for _, rep := range successfulNodes {
-		successfulLocations = append(successfulLocations, rep.Location)
+	// 6. Enforce strict 3/3 replication rules
+	totalRequired := len(targets)
+	successCount := len(successfulNodes)
+
+	var finalStatus string
+	quorumMet := successCount >= 2
+
+	if successCount == totalRequired && successCount >= 3 {
+		finalStatus = models.ReplicationStatusComplete
+	} else if successCount >= 1 {
+		finalStatus = models.ReplicationStatusPartial
+	} else {
+		finalStatus = models.ReplicationStatusFailed
 	}
 
-	if len(successfulNodes) == 0 {
-		log.Printf("[API] Upload failed: all %d storage nodes failed", len(targets))
-		return nil, nil, ErrAllReplicasFailed
+	// 7. Staging File Retention Logic
+	// Only delete the staged copy when replication is 100% COMPLETE (e.g. 3/3 verified).
+	persistedStagedPath := stagedPath
+	if finalStatus == models.ReplicationStatusComplete {
+		log.Printf("[API] 3/3 Replication verified for %s. Safely cleaning local staging file.", fileID)
+		_ = os.Remove(stagedPath)
+		persistedStagedPath = ""
+	} else {
+		log.Printf("[API] Incomplete replication (%d/%d) for %s. Retaining local staged file for recovery.", successCount, totalRequired, fileID)
 	}
 
-	metadata := &models.FileMetadata{
-		ID:           fileID,
-		OriginalName: filename,
-		ContentType:  contentType,
-		Size:         actualSize,
-		CreatedAt:    time.Now().UTC(),
-		Replicas:     successfulNodes,
+	// 8. Update MongoDB with verified replicas only
+	fileMeta.ReplicationStatus = finalStatus
+	fileMeta.QuorumMet = quorumMet
+	fileMeta.Replicas = successfulNodes
+	fileMeta.StagedPath = persistedStagedPath
+
+	_ = s.repo.UpdateReplicationStatus(ctx, fileID, finalStatus, quorumMet, successfulNodes, persistedStagedPath)
+
+	if successCount == 0 {
+		return fileMeta, nil, ErrAllReplicasFailed
 	}
 
-	// Persist metadata to MongoDB
-	if err := s.repo.Create(ctx, metadata); err != nil {
-		log.Printf("[API] MongoDB metadata save FAILED fileId=%s: %v", fileID, err)
-		for _, node := range successfulNodes {
-			_ = s.storageClient.Delete(ctx, node.URL, fileID)
-		}
-		return nil, nil, fmt.Errorf("failed to save metadata to MongoDB: %w", err)
+	repResultObj := &models.ReplicationStatus{
+		Success:            finalStatus == models.ReplicationStatusComplete,
+		Message:            fmt.Sprintf("Replication: %s (%d/%d verified)", finalStatus, successCount, totalRequired),
+		SuccessfulReplicas: successfulNames,
+		FailedReplicas:     failedNames,
 	}
 
-	log.Printf("[API] MongoDB metadata saved fileId=%s, replicas=%d", fileID, len(successfulNodes))
-
-	allReplicated := len(failedLocations) == 0
-	msg := "Replication complete"
-	if !allReplicated {
-		msg = "Replication incomplete"
-	}
-
-	repStatus := &models.ReplicationStatus{
-		Success:            allReplicated,
-		Message:            msg,
-		SuccessfulReplicas: successfulLocations,
-		FailedReplicas:     failedLocations,
-	}
-
-	return metadata, repStatus, nil
+	return fileMeta, repResultObj, nil
 }
 
 // GetFileStream retrieves the file stream by finding the geographically nearest healthy storage node.
-// If the nearest node fails or is down, it gracefully falls back to the next nearest replica.
+// Falls back gracefully to remaining replicas or the local staging directory.
 func (s *FileService) GetFileStream(ctx context.Context, fileID string, r *http.Request) (io.ReadCloser, *models.FileMetadata, string, error) {
 	meta, err := s.repo.FindByID(ctx, fileID)
 	if err != nil {
 		return nil, nil, "", err
 	}
 
-	if len(meta.Replicas) == 0 {
-		return nil, nil, "", errors.New("file has no registered replicas")
-	}
-
 	// 1. Resolve client geographic location
 	clientLoc := s.geoService.ResolveClientLocation(r)
 
-	// 2. Rank available storage nodes by proximity to client using actual registered coordinates
+	// 2. Rank available replicas by proximity
 	rankedNodes := s.rankReplicas(ctx, clientLoc, meta.Replicas)
 
-	log.Printf("[API] Download request fileId=%s, clientIP=%s, country=%s, rankedNodes=%d",
-		fileID, clientLoc.IP, clientLoc.Country, len(rankedNodes))
-
-	// 4. Try nearest replica first; if unavailable, seamlessly fall back to next
-	var lastErr error
-	for i, node := range rankedNodes {
-		isFallback := i > 0
-		if isFallback {
-			log.Printf("[API] FALLBACK to next nearest replica location=%s (distance=%.1f km) for fileId=%s",
-				node.Location, node.DistanceKm, fileID)
-		} else {
-			log.Printf("[API] Attempting nearest replica location=%s (distance=%.1f km) for fileId=%s",
-				node.Location, node.DistanceKm, fileID)
-		}
-
-		stream, _, _, err := s.storageClient.Download(ctx, node.URL, fileID)
+	// 3. Attempt download from nearest replica over SFTP
+	for _, node := range rankedNodes {
+		host, port := s.resolveNodeHostPort(ctx, node.URL)
+		stream, size, err := s.storageClient.Download(ctx, host, port, fileID)
 		if err == nil {
-			log.Printf("[API] Successfully serving fileId=%s from storage location=%s", fileID, node.Location)
+			_ = size
+			log.Printf("[API] Streaming file %s from storage node %s (%s:%d)", fileID, node.Location, host, port)
 			return stream, meta, node.Location, nil
 		}
-
-		log.Printf("[API] Storage node %s unavailable for fileId=%s: %v", node.Location, fileID, err)
-		lastErr = err
+		log.Printf("[API] Failed to stream from replica %s (%s:%d): %v, falling back...", node.Location, host, port, err)
 	}
 
-	return nil, nil, "", fmt.Errorf("%w: %v", ErrNoAvailableServer, lastErr)
+	// 4. Staging Fallback if remote replicas are unavailable
+	if meta.StagedPath != "" {
+		if f, err := os.Open(meta.StagedPath); err == nil {
+			log.Printf("[API] Streaming file %s from local API staging copy (%s)", fileID, meta.StagedPath)
+			return f, meta, "api-staging", nil
+		}
+	}
+
+	return nil, nil, "", ErrNoAvailableServer
 }
 
-// Delete removes the file from all replicas and deletes metadata from MongoDB.
+// Delete marks a file as deleted, commits an atomic DELETE mutation in the journal,
+// removes the staging file, and executes SFTP Remove across all replicas holding the file.
 func (s *FileService) Delete(ctx context.Context, fileID string) error {
+	// 1. Acquire Mutation Barrier Read Lock
+	s.barrier.RLock()
+	defer s.barrier.RUnlock()
+
 	meta, err := s.repo.FindByID(ctx, fileID)
 	if err != nil {
 		return err
 	}
 
-	log.Printf("[API] Deleting file fileId=%s across %d replicas", fileID, len(meta.Replicas))
+	// 2. Atomically record DELETE mutation and tombstone metadata via transaction
+	mongoClient := s.repo.Client()
+	if mongoClient != nil {
+		session, err := mongoClient.StartSession()
+		if err == nil {
+			defer session.EndSession(ctx)
+			_, _ = session.WithTransaction(ctx, func(sc mongo.SessionContext) (interface{}, error) {
+				return s.journalRepo.RecordDeleteTx(ctx, sc, fileID)
+			})
+		} else {
+			_ = s.repo.Delete(ctx, fileID)
+		}
+	} else {
+		_ = s.repo.Delete(ctx, fileID)
+		seq, _ := s.journalRepo.NextSequence(ctx)
+		_ = s.journalRepo.InsertEntry(ctx, &models.MutationJournalEntry{
+			Seq:       seq,
+			Op:        models.OpDelete,
+			FileID:    fileID,
+			CreatedAt: time.Now(),
+		})
+	}
 
+	// 3. Remove local staging copy if present
+	if meta.StagedPath != "" {
+		_ = os.Remove(meta.StagedPath)
+	}
+
+	// 4. Execute SFTP Remove across all registered replicas
 	var wg sync.WaitGroup
 	for _, rep := range meta.Replicas {
 		wg.Add(1)
-		go func(node models.Replica) {
+		go func(r models.Replica) {
 			defer wg.Done()
-			delErr := s.storageClient.Delete(ctx, node.URL, fileID)
-			if delErr != nil {
-				log.Printf("[API] Warning: failed to delete from node %s: %v", node.Location, delErr)
+			host, port := s.resolveNodeHostPort(ctx, r.URL)
+			if err := s.storageClient.Delete(ctx, host, port, fileID); err != nil {
+				log.Printf("[API] SFTP Remove on replica %s failed: %v", r.Location, err)
 			}
 		}(rep)
 	}
 	wg.Wait()
 
-	if err := s.repo.Delete(ctx, fileID); err != nil {
-		return fmt.Errorf("failed to delete metadata from MongoDB: %w", err)
-	}
-
-	log.Printf("[API] File deleted successfully fileId=%s", fileID)
 	return nil
 }
 
-// rankReplicas orders available replicas by proximity to the client using real node coordinates.
-func (s *FileService) rankReplicas(ctx context.Context, clientLoc geo.ClientLocation, replicas []models.Replica) []geo.RankedNode {
-	var ranked []geo.RankedNode
-	var clusterNodes []*models.StorageNode
+func (s *FileService) resolveNodeHostPort(ctx context.Context, nodeIdentifier string) (string, int) {
 	if s.nodeRepo != nil {
-		clusterNodes, _ = s.nodeRepo.FindAll(ctx)
+		node, err := s.nodeRepo.FindByNodeID(ctx, nodeIdentifier)
+		if err == nil && node != nil {
+			port := node.Port
+			if port <= 0 {
+				port = 22
+			}
+			return node.IP, port
+		}
 	}
 
-	nodeMap := make(map[string]*models.StorageNode)
-	for _, n := range clusterNodes {
-		nodeMap[strings.ToLower(n.Region)] = n
-		nodeMap[strings.ToLower(n.Country)] = n
-		nodeMap[strings.ToLower(n.NodeID)] = n
-		nodeMap[strings.ToLower(n.BaseURL())] = n
+	// Check configured fallback nodes
+	for i, n := range s.storageNodes {
+		synthID := fmt.Sprintf("node-%s-%d", n.Location, i+1)
+		cleanHost := strings.TrimPrefix(strings.TrimPrefix(n.URL, "http://"), "https://")
+		port := 22
+		if strings.Contains(cleanHost, ":") {
+			parts := strings.Split(cleanHost, ":")
+			cleanHost = parts[0]
+			if p, err := strconv.Atoi(parts[1]); err == nil && p > 0 {
+				port = p
+			}
+		}
+		if synthID == nodeIdentifier || n.URL == nodeIdentifier || strings.EqualFold(n.Location, nodeIdentifier) || strings.Contains(nodeIdentifier, strings.ToLower(n.Location)) {
+			return cleanHost, port
+		}
 	}
 
+	// Direct IP:port or hostname:port string
+	clean := strings.TrimPrefix(strings.TrimPrefix(nodeIdentifier, "http://"), "https://")
+	if strings.Contains(clean, ":") {
+		parts := strings.Split(clean, ":")
+		p, _ := strconv.Atoi(parts[1])
+		if p <= 0 {
+			p = 22
+		}
+		return parts[0], p
+	}
+	return clean, 22
+}
+
+func (s *FileService) rankReplicas(ctx context.Context, clientLoc geo.ClientLocation, replicas []models.Replica) []models.Replica {
+	type scoredReplica struct {
+		replica  models.Replica
+		distance float64
+	}
+
+	var scored []scoredReplica
 	for _, rep := range replicas {
-		loc := strings.ToLower(rep.Location)
-		if loc == "local" || loc == "" {
-			loc = "singapore"
+		var lat, lon float64
+		found := false
+
+		if s.nodeRepo != nil {
+			node, err := s.nodeRepo.FindByNodeID(ctx, rep.URL)
+			if err == nil && node != nil && (node.Latitude != 0 || node.Longitude != 0) {
+				lat = node.Latitude
+				lon = node.Longitude
+				found = true
+			}
 		}
 
-		coords := s.geoService.GetCoordinatesForLocation(loc)
-		if n, ok := nodeMap[strings.ToLower(rep.URL)]; ok && (n.Latitude != 0 || n.Longitude != 0) {
-			coords = geo.Coordinates{Latitude: n.Latitude, Longitude: n.Longitude}
-		} else if n, ok := nodeMap[loc]; ok && (n.Latitude != 0 || n.Longitude != 0) {
-			coords = geo.Coordinates{Latitude: n.Latitude, Longitude: n.Longitude}
+		if !found {
+			switch strings.ToLower(rep.Location) {
+			case "singapore", "asia":
+				lat, lon = 1.3521, 103.8198
+			case "newyork", "us", "north america":
+				lat, lon = 40.7128, -74.0060
+			case "london", "europe":
+				lat, lon = 51.5074, -0.1278
+			default:
+				lat, lon = 0, 0
+			}
 		}
 
-		dist := geo.Haversine(clientLoc.Coords, coords)
-		ranked = append(ranked, geo.RankedNode{
-			Location:   loc,
-			URL:        rep.URL,
-			DistanceKm: math.Round(dist*10) / 10,
-		})
+		dist := geo.Haversine(clientLoc.Coords, geo.Coordinates{Latitude: lat, Longitude: lon})
+		scored = append(scored, scoredReplica{replica: rep, distance: dist})
 	}
 
-	sort.Slice(ranked, func(i, j int) bool {
-		return ranked[i].DistanceKm < ranked[j].DistanceKm
+	sort.Slice(scored, func(i, j int) bool {
+		return scored[i].distance < scored[j].distance
 	})
-	return ranked
+
+	var result []models.Replica
+	for _, sc := range scored {
+		result = append(result, sc.replica)
+	}
+	return result
 }
 
-// ReconcileReplicas ensures MongoDB file metadata reflects all online storage nodes
-// that have the files on disk, and normalizes legacy "local" locations to "singapore".
-func (s *FileService) ReconcileReplicas(ctx context.Context) {
-	if s.nodeRepo == nil {
-		return
-	}
-	onlineNodes, err := s.nodeRepo.FindOnline(ctx)
-	if err != nil || len(onlineNodes) == 0 {
-		return
-	}
-
-	files, err := s.repo.FindAll(ctx)
-	if err != nil {
-		return
-	}
-
-	for _, file := range files {
-		var updated []models.Replica
-		nodeMap := make(map[string]bool)
-
-		for _, r := range file.Replicas {
-			loc := r.Location
-			if loc == "local" || loc == "" {
-				loc = "singapore"
-			}
-			updated = append(updated, models.Replica{
-				Location: loc,
-				URL:      r.URL,
-			})
-			nodeMap[r.URL] = true
-			nodeMap[strings.ToLower(loc)] = true
-		}
-
-		// Check all online nodes in cluster
-		for _, n := range onlineNodes {
-			locName := strings.ToLower(n.Country)
-			if locName == "" || locName == "unknown" {
-				locName = strings.ToLower(n.Region)
-			}
-			if locName == "local" || locName == "" {
-				locName = "singapore"
-			}
-
-			if !nodeMap[n.BaseURL()] && !nodeMap[locName] {
-				// Node is online and synchronized
-				updated = append(updated, models.Replica{
-					Location: locName,
-					URL:      n.BaseURL(),
-				})
-				nodeMap[n.BaseURL()] = true
-				nodeMap[locName] = true
-			}
-		}
-
-		if len(updated) != len(file.Replicas) || (len(file.Replicas) > 0 && file.Replicas[0].Location == "local") {
-			_ = s.repo.UpdateReplicas(ctx, file.ID, updated)
-		}
-	}
-}
-
-// ListFiles lists all file metadata documents and reconciles replicas with online nodes.
+// ListFiles returns all active file metadata records.
 func (s *FileService) ListFiles(ctx context.Context) ([]*models.FileMetadata, error) {
-	s.ReconcileReplicas(ctx)
 	return s.repo.FindAll(ctx)
 }
 
-// GetMetadata returns metadata for a single file.
-func (s *FileService) GetMetadata(ctx context.Context, fileID string) (*models.FileMetadata, error) {
-	s.ReconcileReplicas(ctx)
-	return s.repo.FindByID(ctx, fileID)
-}
-
-// GetLocationDebug computes dynamic distance metrics for all currently registered storage nodes in the cluster.
+// GetLocationDebug provides diagnostic information regarding nearest server calculation.
 func (s *FileService) GetLocationDebug(ctx context.Context, fileID string, r *http.Request) (*models.LocationDebugResponse, error) {
-	s.ReconcileReplicas(ctx)
-
 	meta, err := s.repo.FindByID(ctx, fileID)
 	if err != nil {
 		return nil, err
@@ -425,85 +554,31 @@ func (s *FileService) GetLocationDebug(ctx context.Context, fileID string, r *ht
 
 	clientLoc := s.geoService.ResolveClientLocation(r)
 
-	// Reconcile and normalize file replicas
 	var availableReplicas []string
 	replicaMap := make(map[string]bool)
 	for _, rep := range meta.Replicas {
 		loc := strings.ToLower(rep.Location)
-		if loc == "local" || loc == "" {
-			loc = "singapore"
-		}
 		if !replicaMap[loc] {
 			replicaMap[loc] = true
 			availableReplicas = append(availableReplicas, loc)
 		}
 	}
 
-	// Dynamic calculation of distances: ONLY for actually registered cluster nodes in MongoDB!
 	distances := make(map[string]float64)
-	var clusterNodes []*models.StorageNode
-	if s.nodeRepo != nil {
-		clusterNodes, _ = s.nodeRepo.FindAll(ctx)
+	targets := s.getActiveStorageNodes(ctx)
+	for _, t := range targets {
+		coords := s.geoService.GetCoordinatesForLocation(t.location)
+		dist := geo.Haversine(clientLoc.Coords, coords)
+		distances[t.location] = float64(int(dist*10)) / 10
 	}
 
-	if len(clusterNodes) > 0 {
-		for _, n := range clusterNodes {
-			loc := strings.ToLower(n.Country)
-			if loc == "" || loc == "unknown" {
-				loc = strings.ToLower(n.Region)
-			}
-			if loc == "local" || loc == "" {
-				loc = "singapore"
-			}
-
-			coords := geo.Coordinates{Latitude: n.Latitude, Longitude: n.Longitude}
-			if coords.Latitude == 0 && coords.Longitude == 0 {
-				coords = s.geoService.GetCoordinatesForLocation(loc)
-			}
-			dist := geo.Haversine(clientLoc.Coords, coords)
-			distances[loc] = math.Round(dist*10) / 10
-
-			// Check if file is available on this node by URL or location
-			for _, r := range meta.Replicas {
-				if r.URL == n.BaseURL() || strings.EqualFold(r.Location, loc) || strings.EqualFold(r.Location, n.Region) {
-					if !replicaMap[loc] {
-						replicaMap[loc] = true
-						availableReplicas = append(availableReplicas, loc)
-					}
-				}
-			}
-		}
-	} else {
-		// Fallback only if no dynamic nodes exist
-		for _, node := range s.storageNodes {
-			loc := strings.ToLower(node.Location)
-			if loc == "local" || loc == "" {
-				loc = "singapore"
-			}
-			coords := s.geoService.GetCoordinatesForLocation(loc)
-			dist := geo.Haversine(clientLoc.Coords, coords)
-			distances[loc] = math.Round(dist*10) / 10
-		}
-	}
-
-	// Calculate Nearest Storage:
-	// Find the available replica with minimum distance to the client
 	nearest := "unknown"
-	minDist := math.MaxFloat64
+	minDist := 1e12
 	for _, repLoc := range availableReplicas {
 		if d, ok := distances[repLoc]; ok {
 			if d < minDist {
 				minDist = d
 				nearest = repLoc
-			}
-		}
-	}
-	// Fallback to nearest registered node if not resolved
-	if nearest == "unknown" && len(distances) > 0 {
-		for loc, d := range distances {
-			if d < minDist {
-				minDist = d
-				nearest = loc
 			}
 		}
 	}
@@ -529,13 +604,12 @@ func (s *FileService) GetSystemStatus(ctx context.Context) *models.SystemStatusR
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 
-	targets := s.getActiveReplicationTargets(ctx)
-
+	targets := s.getActiveStorageNodes(ctx)
 	for _, node := range targets {
 		wg.Add(1)
-		go func(n models.Replica) {
+		go func(t targetNode) {
 			defer wg.Done()
-			online, loc, err := s.storageClient.Health(ctx, n.URL)
+			online, err := s.storageClient.Health(ctx, t.ip, t.port)
 			statusStr := "ONLINE"
 			errStr := ""
 			if !online || err != nil {
@@ -544,15 +618,12 @@ func (s *FileService) GetSystemStatus(ctx context.Context) *models.SystemStatusR
 					errStr = err.Error()
 				}
 			}
-			if loc == "" {
-				loc = n.Location
-			}
 
 			mu.Lock()
 			storageHealth = append(storageHealth, models.NodeHealth{
-				Name:     fmt.Sprintf("Storage (%s)", n.Location),
-				Location: loc,
-				URL:      n.URL,
+				Name:     fmt.Sprintf("Storage (%s)", t.location),
+				Location: t.location,
+				URL:      fmt.Sprintf("%s:%d", t.ip, t.port),
 				Status:   statusStr,
 				Error:    errStr,
 			})

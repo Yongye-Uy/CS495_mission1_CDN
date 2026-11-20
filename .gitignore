@@ -21,8 +21,14 @@ data/
 /Storage/data/
 /Docker/storage/data/
 
-# Docker local simulation folder (excluded as requested)
-Docker/
+# Environment files
+.env
+*.env
+.env.local
+
+# Docker dynamically generated keys and known_hosts (keep Docker configuration tracked)
+Docker/keys/
+Docker/api/cdn_known_hosts
 
 # Setup documentation (kept on local machine only, excluded from GitHub)
 API_SERVER_SETUP.md

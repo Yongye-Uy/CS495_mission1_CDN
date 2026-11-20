@@ -10,6 +10,7 @@ import (
 
 	"mini-cdn/website/internal/config"
 	"mini-cdn/website/internal/handlers"
+	"mini-cdn/website/internal/middleware"
 )
 
 func findDir(candidates ...string) string {
@@ -40,6 +41,7 @@ func main() {
 	}
 
 	r := gin.Default()
+	r.Use(middleware.CSRFMiddleware())
 
 	// Load HTML templates
 	pattern := filepath.Join(templatesDir, "*.html")
@@ -52,18 +54,29 @@ func main() {
 	r.GET("/health", webHandler.HealthCheck)
 	r.HEAD("/health", webHandler.HealthCheck)
 
-	// Web page routes (support both GET and HEAD)
+	// Public Web page routes (support both GET and HEAD)
 	r.GET("/", webHandler.Index)
 	r.HEAD("/", webHandler.Index)
 	r.GET("/files", webHandler.Index)
 	r.HEAD("/files", webHandler.Index)
 	r.GET("/nodes", webHandler.NodesPage)
 	r.HEAD("/nodes", webHandler.NodesPage)
-	r.GET("/nodes/add", webHandler.AddNodePage)
-	r.HEAD("/nodes/add", webHandler.AddNodePage)
+
+	// Admin Authentication routes
+	r.GET("/admin/login", webHandler.LoginPage)
+	r.POST("/admin/login", middleware.ValidateCSRF(), webHandler.HandleLogin)
+	r.POST("/admin/logout", webHandler.HandleLogout)
+
+	// Admin Protected routes
+	admin := r.Group("")
+	admin.Use(middleware.RequireAdminSession(cfg))
+	{
+		admin.GET("/nodes/add", webHandler.AddNodePage)
+		admin.HEAD("/nodes/add", webHandler.AddNodePage)
+		admin.POST("/nodes/add", middleware.ValidateCSRF(), webHandler.HandleAddNode)
+	}
 
 	// Actions
-	r.POST("/nodes/add", webHandler.HandleAddNode)
 	r.POST("/upload", webHandler.HandleUpload)
 	r.POST("/delete/:id", webHandler.HandleDelete)
 

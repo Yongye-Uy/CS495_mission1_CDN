@@ -43,6 +43,16 @@ func getAPIURL() string {
 	return "http://localhost:8080"
 }
 
+func getAdminKey() string {
+	if k := os.Getenv("CENTRAL_API_ADMIN_KEY"); k != "" {
+		return k
+	}
+	if k := os.Getenv("ADMIN_API_KEY"); k != "" {
+		return k
+	}
+	return ""
+}
+
 func main() {
 	if len(os.Args) < 2 {
 		printUsage()
@@ -92,12 +102,13 @@ func printUsage() {
 	fmt.Println("  on_board health")
 	fmt.Println()
 	fmt.Println("Environment Variables:")
-	fmt.Println("  API_URL    Central API base URL (default: http://localhost:8080)")
+	fmt.Println("  API_URL                Central API base URL (default: http://localhost:8080)")
+	fmt.Println("  CENTRAL_API_ADMIN_KEY  Secret administrator key for node mutations (X-Admin-Key)")
 }
 
 func handleAddNode(apiURL string, args []string) {
 	req := OnboardRequest{
-		Port: 8081,
+		Port: 22,
 	}
 
 	for _, arg := range args {
@@ -157,7 +168,17 @@ func handleAddNode(apiURL string, args []string) {
 	}
 
 	client := &http.Client{Timeout: 60 * time.Second}
-	resp, err := client.Post(apiURL+"/api/nodes", "application/json", bytes.NewReader(payload))
+	httpReq, err := http.NewRequest(http.MethodPost, apiURL+"/api/nodes", bytes.NewReader(payload))
+	if err != nil {
+		fmt.Printf("Error creating request: %v\n", err)
+		os.Exit(1)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	if key := getAdminKey(); key != "" {
+		httpReq.Header.Set("X-Admin-Key", key)
+	}
+
+	resp, err := client.Do(httpReq)
 	if err != nil {
 		fmt.Printf("Error: Failed to contact Central API: %v\n", err)
 		os.Exit(1)
@@ -240,6 +261,9 @@ func handleRemoveNode(apiURL, nodeID string) {
 	if err != nil {
 		fmt.Printf("Error constructing request: %v\n", err)
 		os.Exit(1)
+	}
+	if key := getAdminKey(); key != "" {
+		req.Header.Set("X-Admin-Key", key)
 	}
 
 	resp, err := client.Do(req)

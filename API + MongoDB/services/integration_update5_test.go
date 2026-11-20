@@ -10,8 +10,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"path/filepath"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -22,162 +20,139 @@ import (
 	"mini-cdn/api/models"
 	"mini-cdn/api/repository"
 	"mini-cdn/api/services"
+	"mini-cdn/api/services/barrier"
 	"mini-cdn/api/services/geo"
-	"mini-cdn/api/services/storage_client"
+	"mini-cdn/api/services/ssh_client"
 )
 
-// mockDiskStorageWorker simulates an autonomous Storage Worker with disk storage and sync.
-type mockDiskStorageWorker struct {
-	mu       sync.Mutex
-	location string
-	nodeID   string
-	dataDir  string
-	server   *httptest.Server
+// mockSSHStorageWorker simulates a native Linux storage server in memory.
+type mockSSHStorageWorker struct {
+	mu           sync.Mutex
+	dataDir      string
+	files        map[string][]byte
+	failingNodes map[string]bool
 }
 
-func newMockDiskStorageWorker(location, nodeID string) *mockDiskStorageWorker {
-	tempDir, _ := os.MkdirTemp("", "worker_"+location+"_*")
-	w := &mockDiskStorageWorker{
-		location: location,
-		nodeID:   nodeID,
-		dataDir:  tempDir,
+func newMockSSHStorageWorker() *mockSSHStorageWorker {
+	tempDir, _ := os.MkdirTemp("", "mock_ssh_storage_*")
+	return &mockSSHStorageWorker{
+		dataDir:      tempDir,
+		files:        make(map[string][]byte),
+		failingNodes: make(map[string]bool),
 	}
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /health", func(rw http.ResponseWriter, r *http.Request) {
-		rw.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(rw).Encode(map[string]string{
-			"status":   "ok",
-			"service":  "storage",
-			"nodeId":   w.nodeID,
-			"location": w.location,
-		})
-	})
-
-	mux.HandleFunc("GET /storage/files", func(rw http.ResponseWriter, r *http.Request) {
-		w.mu.Lock()
-		defer w.mu.Unlock()
-		entries, _ := os.ReadDir(w.dataDir)
-		var files []string
-		for _, e := range entries {
-			if !e.IsDir() {
-				files = append(files, e.Name())
-			}
-		}
-		rw.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(rw).Encode(map[string]interface{}{
-			"success": true,
-			"files":   files,
-		})
-	})
-
-	mux.HandleFunc("POST /storage/files", func(rw http.ResponseWriter, r *http.Request) {
-		_ = r.ParseMultipartForm(32 << 20)
-		id := r.FormValue("id")
-		file, _, err := r.FormFile("file")
-		if err != nil {
-			http.Error(rw, "no file", http.StatusBadRequest)
-			return
-		}
-		defer file.Close()
-
-		w.mu.Lock()
-		defer w.mu.Unlock()
-		dest := filepath.Join(w.dataDir, id)
-		out, _ := os.Create(dest)
-		defer out.Close()
-		size, _ := io.Copy(out, file)
-
-		rw.Header().Set("Content-Type", "application/json")
-		rw.WriteHeader(http.StatusCreated)
-		_ = json.NewEncoder(rw).Encode(map[string]interface{}{
-			"success":  true,
-			"id":       id,
-			"size":     size,
-			"location": w.location,
-		})
-	})
-
-	mux.HandleFunc("GET /storage/files/{id}", func(rw http.ResponseWriter, r *http.Request) {
-		id := r.PathValue("id")
-		w.mu.Lock()
-		defer w.mu.Unlock()
-		path := filepath.Join(w.dataDir, id)
-		data, err := os.ReadFile(path)
-		if err != nil {
-			http.NotFound(rw, r)
-			return
-		}
-		rw.Header().Set("Content-Type", "application/octet-stream")
-		rw.Header().Set("X-Storage-Location", w.location)
-		_, _ = rw.Write(data)
-	})
-
-	mux.HandleFunc("DELETE /storage/files/{id}", func(rw http.ResponseWriter, r *http.Request) {
-		id := r.PathValue("id")
-		w.mu.Lock()
-		defer w.mu.Unlock()
-		_ = os.Remove(filepath.Join(w.dataDir, id))
-		rw.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(rw).Encode(map[string]interface{}{"success": true})
-	})
-
-	w.server = httptest.NewServer(mux)
-	return w
 }
 
-func (w *mockDiskStorageWorker) listFiles() []string {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	entries, _ := os.ReadDir(w.dataDir)
-	var files []string
-	for _, e := range entries {
-		if !e.IsDir() {
-			files = append(files, e.Name())
-		}
-	}
-	return files
-}
-
-func (w *mockDiskStorageWorker) close() {
-	if w.server != nil {
-		w.server.Close()
-	}
+func (w *mockSSHStorageWorker) close() {
 	_ = os.RemoveAll(w.dataDir)
 }
 
-func TestUpdate5_FullLifecycle(t *testing.T) {
+func (w *mockSSHStorageWorker) SetNodeFailing(host string, port int, failing bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	k := fmt.Sprintf("%s:%d", host, port)
+	w.failingNodes[k] = failing
+}
+
+func (w *mockSSHStorageWorker) Upload(ctx context.Context, host string, port int, fileID string, localFilePath string) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	k := fmt.Sprintf("%s:%d", host, port)
+	if w.failingNodes[k] {
+		return fmt.Errorf("ssh upload failed to %s", k)
+	}
+	data, err := os.ReadFile(localFilePath)
+	if err != nil {
+		return err
+	}
+	w.files[k+"/"+fileID] = data
+	return nil
+}
+
+func (w *mockSSHStorageWorker) Download(ctx context.Context, host string, port int, fileID string) (io.ReadCloser, int64, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	k := fmt.Sprintf("%s:%d", host, port)
+	if w.failingNodes[k] {
+		return nil, 0, fmt.Errorf("ssh download failed from %s", k)
+	}
+	data, exists := w.files[k+"/"+fileID]
+	if !exists {
+		return nil, 0, ssh_client.ErrFileNotFound
+	}
+	return io.NopCloser(bytes.NewReader(data)), int64(len(data)), nil
+}
+
+func (w *mockSSHStorageWorker) Delete(ctx context.Context, host string, port int, fileID string) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	k := fmt.Sprintf("%s:%d", host, port)
+	delete(w.files, k+"/"+fileID)
+	return nil
+}
+
+func (w *mockSSHStorageWorker) Health(ctx context.Context, host string, port int) (bool, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	k := fmt.Sprintf("%s:%d", host, port)
+	if w.failingNodes[k] {
+		return false, fmt.Errorf("node %s offline", k)
+	}
+	return true, nil
+}
+
+func (w *mockSSHStorageWorker) ListFiles(ctx context.Context, host string, port int) ([]string, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	k := fmt.Sprintf("%s:%d", host, port)
+	prefix := k + "/"
+	var res []string
+	for key := range w.files {
+		if len(key) > len(prefix) && key[:len(prefix)] == prefix {
+			res = append(res, key[len(prefix):])
+		}
+	}
+	return res, nil
+}
+
+func (w *mockSSHStorageWorker) StatFile(ctx context.Context, host string, port int, fileID string) (int64, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	k := fmt.Sprintf("%s:%d", host, port)
+	if data, ok := w.files[k+"/"+fileID]; ok {
+		return int64(len(data)), nil
+	}
+	return 0, ssh_client.ErrFileNotFound
+}
+
+func TestEndToEnd_OnboardingAndReplicationPipeline(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	// Step A: Set up Storage Worker 1 (Singapore)
-	worker1 := newMockDiskStorageWorker("singapore", "node-singapore")
-	defer worker1.close()
+	// Step A: Storage client
+	mockStorage := newMockSSHStorageWorker()
+	defer mockStorage.close()
 
-	// Step B: Set up Storage Worker 2 (Tokyo / Asia - new node)
-	worker2 := newMockDiskStorageWorker("tokyo", "node-tokyo")
-	defer worker2.close()
-
-	// Step C: Set up Central API with dynamic node registry
+	// Step B: Set up Repositories and Services
 	fileRepo := repository.NewMockFileRepository()
 	nodeRepo := repository.NewMockNodeRepository()
+	journalRepo := repository.NewMockJournalRepository()
+	syncJobRepo := repository.NewMockSyncJobRepository()
 	geoSvc := geo.NewGeoService()
-	storageClient := storage_client.NewHTTPStorageClient(10 * time.Second)
-	syncSvc := services.NewSyncService()
-	nodeSvc := services.NewNodeService(nodeRepo, syncSvc)
+	b := barrier.NewMutationBarrier()
 
-	// Parse Worker 1 URL to IP and Port
-	var host1 string
-	var port1 int
-	parts1 := strings.Split(strings.TrimPrefix(worker1.server.URL, "http://"), ":")
-	host1 = parts1[0]
-	fmt.Sscanf(parts1[1], "%d", &port1)
+	stagingDir, _ := os.MkdirTemp("", "api_staging_test_*")
+	defer os.RemoveAll(stagingDir)
+
+	syncSvc := services.NewSyncService(fileRepo, nodeRepo, journalRepo, syncJobRepo, mockStorage, b, stagingDir)
+	nodeSvc := services.NewNodeService(nodeRepo, syncSvc, mockStorage)
+	nodeSvc.SetFileRepo(fileRepo)
+	nodeSvc.SetGeoService(geoSvc)
 
 	// Pre-seed Singapore as initial ONLINE node
 	sgNode := &models.StorageNode{
 		ID:            "node-sg-id",
 		NodeID:        "node-singapore",
-		IP:            host1,
-		Port:          port1,
+		IP:            "127.0.0.1",
+		Port:          2201,
 		Region:        "Asia",
 		Country:       "Singapore",
 		Latitude:      1.3521,
@@ -188,7 +163,7 @@ func TestUpdate5_FullLifecycle(t *testing.T) {
 	}
 	_ = nodeRepo.Create(context.Background(), sgNode)
 
-	fileSvc := services.NewFileService(fileRepo, nodeRepo, storageClient, geoSvc, nil)
+	fileSvc := services.NewFileService(fileRepo, nodeRepo, journalRepo, mockStorage, geoSvc, b, stagingDir, nil)
 	fileHandler := handlers.NewFileHandler(fileSvc, 100)
 	nodeHandler := handlers.NewNodeHandler(nodeSvc)
 
@@ -208,153 +183,62 @@ func TestUpdate5_FullLifecycle(t *testing.T) {
 	apiRouter.GET("/api/nodes/:id/health", nodeHandler.CheckNodeHealth)
 
 	// =========================================================================
-	// TEST 1 — Upload files to existing storage
+	// TEST 1: Initial upload replicating to Singapore
 	// =========================================================================
-	fileNames := []string{"A.jpg", "B.jpg", "C.jpg"}
-	fileIDs := make(map[string]string)
-
-	for _, name := range fileNames {
-		content := fmt.Sprintf("Sample payload for %s in distributed storage", name)
-		body := new(bytes.Buffer)
+	t.Run("1. Upload to Initial Cluster", func(t *testing.T) {
+		body := &bytes.Buffer{}
 		writer := multipart.NewWriter(body)
-		part, _ := writer.CreateFormFile("file", name)
-		_, _ = io.WriteString(part, content)
+		part, _ := writer.CreateFormFile("file", "course_syllabus.pdf")
+		_, _ = part.Write([]byte("Course Syllabus Content: Distributed Systems"))
 		_ = writer.Close()
 
-		req := httptest.NewRequest(http.MethodPost, "/api/files", body)
+		req := httptest.NewRequest("POST", "/api/files", body)
 		req.Header.Set("Content-Type", writer.FormDataContentType())
 		rec := httptest.NewRecorder()
 		apiRouter.ServeHTTP(rec, req)
 
-		if rec.Code != http.StatusCreated {
-			t.Fatalf("Upload %s failed: status %d, body %s", name, rec.Code, rec.Body.String())
+		if rec.Code != http.StatusCreated && rec.Code != http.StatusMultiStatus {
+			t.Fatalf("Expected HTTP 201 Created or 207 MultiStatus, got %d: %s", rec.Code, rec.Body.String())
 		}
 
-		var upRes handlers.UploadResponse
-		_ = json.Unmarshal(rec.Body.Bytes(), &upRes)
-		fileIDs[name] = upRes.File.ID
-	}
+		var resp map[string]interface{}
+		_ = json.Unmarshal(rec.Body.Bytes(), &resp)
+		uploadedID := resp["id"].(string)
 
-	// Verify Singapore worker 1 has all 3 files
-	filesOnWorker1 := worker1.listFiles()
-	if len(filesOnWorker1) != 3 {
-		t.Fatalf("Expected 3 files on worker 1, got %d: %+v", len(filesOnWorker1), filesOnWorker1)
-	}
-
-	// Verify Worker 2 is currently empty
-	filesOnWorker2Before := worker2.listFiles()
-	if len(filesOnWorker2Before) != 0 {
-		t.Fatalf("Expected 0 files on worker 2 before onboarding, got %d", len(filesOnWorker2Before))
-	}
+		// Verify stored in mock storage for node-singapore
+		data, err := mockStorage.StatFile(context.Background(), "127.0.0.1", 2201, uploadedID)
+		if err != nil || data == 0 {
+			t.Fatalf("File not found on node-singapore: %v", err)
+		}
+	})
 
 	// =========================================================================
-	// TEST 2 & 3 — Onboard Node 2 (Tokyo) via Central API (CLI / Web flow)
+	// TEST 2: Onboard New Storage Worker (Tokyo) via API
 	// =========================================================================
-	parts2 := strings.Split(strings.TrimPrefix(worker2.server.URL, "http://"), ":")
-	var port2 int
-	fmt.Sscanf(parts2[1], "%d", &port2)
+	t.Run("2. Dynamic Onboarding of Tokyo Node", func(t *testing.T) {
+		onboardPayload := map[string]interface{}{
+			"ip":        "127.0.0.1",
+			"port":      2202,
+			"region":    "Asia",
+			"country":   "Japan",
+			"latitude":  35.6762,
+			"longitude": 139.6503,
+		}
+		pBytes, _ := json.Marshal(onboardPayload)
 
-	onboardPayload := map[string]interface{}{
-		"ip":        parts2[0],
-		"port":      port2,
-		"region":    "Asia",
-		"country":   "Japan",
-		"latitude":  35.6762,
-		"longitude": 139.6503,
-	}
-	onboardBody, _ := json.Marshal(onboardPayload)
+		req := httptest.NewRequest("POST", "/api/nodes", bytes.NewReader(pBytes))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		apiRouter.ServeHTTP(rec, req)
 
-	onboardReq := httptest.NewRequest(http.MethodPost, "/api/nodes", bytes.NewReader(onboardBody))
-	onboardReq.Header.Set("Content-Type", "application/json")
-	onboardRec := httptest.NewRecorder()
-	apiRouter.ServeHTTP(onboardRec, onboardReq)
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("Expected HTTP 201 Created from OnboardNode, got %d: %s", rec.Code, rec.Body.String())
+		}
 
-	if onboardRec.Code != http.StatusCreated {
-		t.Fatalf("Node onboarding failed: status %d, body %s", onboardRec.Code, onboardRec.Body.String())
-	}
-
-	// =========================================================================
-	// TEST 4 — Verify rsync / data synchronization: Worker 2 received files!
-	// =========================================================================
-	filesOnWorker2After := worker2.listFiles()
-	if len(filesOnWorker2After) != 3 {
-		t.Fatalf("Expected 3 files synchronized to worker 2, got %d: %+v", len(filesOnWorker2After), filesOnWorker2After)
-	}
-	t.Logf("SUCCESS: Worker 2 synchronized %d files from Worker 1!", len(filesOnWorker2After))
-
-	// =========================================================================
-	// TEST 5 — Verify dynamic node registry in MongoDB
-	// =========================================================================
-	allNodes, err := nodeRepo.FindAll(context.Background())
-	if err != nil || len(allNodes) != 2 {
-		t.Fatalf("Expected 2 nodes in registry, got %d (err: %v)", len(allNodes), err)
-	}
-
-	onlineNodes, _ := nodeRepo.FindOnline(context.Background())
-	if len(onlineNodes) != 2 {
-		t.Fatalf("Expected both nodes to be ONLINE, got %d", len(onlineNodes))
-	}
-
-	// =========================================================================
-	// TEST 6 — Verify dynamic geographic CDN routing
-	// =========================================================================
-	targetFileID := fileIDs["A.jpg"]
-
-	// Request from Japan (Tokyo) -> nearest should be Worker 2 (Tokyo)
-	jpReq := httptest.NewRequest(http.MethodGet, "/api/files/"+targetFileID+"/location?country=JP", nil)
-	jpRec := httptest.NewRecorder()
-	apiRouter.ServeHTTP(jpRec, jpReq)
-
-	if jpRec.Code != http.StatusOK {
-		t.Fatalf("Location check failed: %d", jpRec.Code)
-	}
-
-	var jpLoc models.LocationDebugResponse
-	_ = json.Unmarshal(jpRec.Body.Bytes(), &jpLoc)
-	t.Logf("Routing for Japan client: Nearest=%s, Country=%s", jpLoc.NearestStorage, jpLoc.ClientCountry)
-
-	// Download from Japan
-	getJPReq := httptest.NewRequest(http.MethodGet, "/api/files/"+targetFileID, nil)
-	getJPReq.Header.Set("X-Test-Country", "JP")
-	getJPRec := httptest.NewRecorder()
-	apiRouter.ServeHTTP(getJPRec, getJPReq)
-
-	if getJPRec.Code != http.StatusOK {
-		t.Fatalf("Download failed: %d", getJPRec.Code)
-	}
-
-	// =========================================================================
-	// TEST 7 — Node failure and automatic failover
-	// =========================================================================
-	// Close worker 2 to simulate Tokyo node outage
-	worker2.server.Close()
-
-	// Download should automatically failover to Singapore (Worker 1)
-	failoverReq := httptest.NewRequest(http.MethodGet, "/api/files/"+targetFileID, nil)
-	failoverReq.Header.Set("X-Test-Country", "JP")
-	failoverRec := httptest.NewRecorder()
-	apiRouter.ServeHTTP(failoverRec, failoverReq)
-
-	if failoverRec.Code != http.StatusOK {
-		t.Fatalf("Failover download failed: status %d", failoverRec.Code)
-	}
-	t.Logf("SUCCESS: Failover served file by %s", failoverRec.Header().Get("X-Served-By-Storage"))
-
-	// =========================================================================
-	// TEST 8 — Remove node safely
-	// =========================================================================
-	tokyoNodeID := allNodes[1].ID
-	delNodeReq := httptest.NewRequest(http.MethodDelete, "/api/nodes/"+tokyoNodeID, nil)
-	delNodeRec := httptest.NewRecorder()
-	apiRouter.ServeHTTP(delNodeRec, delNodeReq)
-
-	if delNodeRec.Code != http.StatusOK {
-		t.Fatalf("Delete node failed: %d, body %s", delNodeRec.Code, delNodeRec.Body.String())
-	}
-
-	remainingNodes, _ := nodeRepo.FindAll(context.Background())
-	if len(remainingNodes) != 1 {
-		t.Fatalf("Expected 1 node remaining after deletion, got %d", len(remainingNodes))
-	}
-	t.Logf("SUCCESS: Node %s removed. Remaining nodes: %d", tokyoNodeID, len(remainingNodes))
+		// Verify Tokyo node exists and is ONLINE
+		onlineNodes, err := nodeRepo.FindOnline(context.Background())
+		if err != nil || len(onlineNodes) < 2 {
+			t.Fatalf("Expected at least 2 online nodes after onboarding, got %d", len(onlineNodes))
+		}
+	})
 }

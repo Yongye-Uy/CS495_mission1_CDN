@@ -13,12 +13,14 @@ import (
 	"github.com/google/uuid"
 
 	"mini-cdn/api/handlers"
+	"mini-cdn/api/handlers/middleware"
 	"mini-cdn/api/internal/config"
 	"mini-cdn/api/models"
 	"mini-cdn/api/repository"
 	"mini-cdn/api/services"
+	"mini-cdn/api/services/barrier"
 	"mini-cdn/api/services/geo"
-	"mini-cdn/api/services/storage_client"
+	"mini-cdn/api/services/ssh_client"
 )
 
 func main() {
@@ -37,37 +39,56 @@ func main() {
 
 	repo, err := repository.NewMongoFileRepository(ctx, cfg.MongoURI, cfg.MongoDB)
 	var nodeRepo repository.NodeRepository
+	var journalRepo repository.JournalRepository
+	var syncJobRepo repository.SyncJobRepository
 
 	if err != nil {
 		log.Printf("[API] WARNING: Could not connect to MongoDB initially: %v", err)
 		log.Printf("[API] Using in-memory repositories fallback until MongoDB is online.")
 		nodeRepo = repository.NewMockNodeRepository()
+		journalRepo = repository.NewMockJournalRepository()
+		syncJobRepo = repository.NewMockSyncJobRepository()
 	} else {
 		log.Println("[API] Successfully connected to MongoDB.")
 		nodeRepo = repository.NewMongoNodeRepository(repo.Client(), cfg.MongoDB)
+		journalRepo = repository.NewMongoJournalRepository(repo.Client(), cfg.MongoDB)
+		syncJobRepo = repository.NewMongoSyncJobRepository(repo.Client(), cfg.MongoDB)
 	}
 
 	// Geolocation service
 	geoService := geo.NewGeoService()
 
-	// Storage client & Sync service
-	storageClient := storage_client.NewHTTPStorageClient(15 * time.Second)
-	syncService := services.NewSyncService()
-	nodeService := services.NewNodeService(nodeRepo, syncService)
+	// Mutation Barrier Mutex
+	barrierMutex := barrier.NewMutationBarrier()
+
+	// Strict SSH & rsync storage client
+	storageClient, err := ssh_client.NewSSHStorageClient(cfg.SSHKeyPath, cfg.KnownHostsPath, cfg.SSHUser, cfg.StorageDataDir)
+	if err != nil {
+		log.Printf("[API] WARNING: Could not initialize SSH client: %v. Running in mock/fallback mode.", err)
+	} else {
+		log.Printf("[API] Strict SSH storage client initialized (Key: %s, KnownHosts: %s).", cfg.SSHKeyPath, cfg.KnownHostsPath)
+	}
+
+	// Sync service & Node service
+	syncService := services.NewSyncService(repo, nodeRepo, journalRepo, syncJobRepo, storageClient, barrierMutex, cfg.StagingDir)
+	nodeService := services.NewNodeService(nodeRepo, syncService, storageClient)
 	nodeService.SetFileRepo(repo)
 	nodeService.SetGeoService(geoService)
 
 	// Seed default nodes if repository is empty
 	seedInitialNodes(context.Background(), nodeRepo, geoService, cfg.StorageNodes)
 
-	// Start background node health monitor (heartbeat probe every 20 seconds)
+	// Start background node health monitor
 	nodeService.StartHeartbeatMonitor(20 * time.Second)
 
-	// File Service & Handlers
-	fileService := services.NewFileService(repo, nodeRepo, storageClient, geoService, cfg.StorageNodes)
-	fileService.ReconcileReplicas(context.Background())
+	// File Service
+	fileService := services.NewFileService(repo, nodeRepo, journalRepo, storageClient, geoService, barrierMutex, cfg.StagingDir, cfg.StorageNodes)
 	fileHandler := handlers.NewFileHandler(fileService, cfg.MaxUploadSizeMB)
 	nodeHandler := handlers.NewNodeHandler(nodeService)
+
+	// Background Quorum Recovery Worker
+	recoveryWorker := services.NewReplicationRecoveryWorker(repo, nodeRepo, storageClient, barrierMutex, cfg.StagingDir, 30*time.Second)
+	recoveryWorker.Start(context.Background())
 
 	// Initialize Gin engine
 	r := gin.Default()
@@ -89,14 +110,20 @@ func main() {
 		apiFiles.GET("/:id/location", fileHandler.Location)
 	}
 
-	// Node Management API endpoints (UPDATE 5)
+	// Node Management API endpoints (Protected by X-Admin-Key)
 	apiNodes := r.Group("/api/nodes")
 	{
 		apiNodes.GET("", nodeHandler.ListNodes)
-		apiNodes.POST("", nodeHandler.OnboardNode)
 		apiNodes.GET("/:id", nodeHandler.GetNode)
-		apiNodes.DELETE("/:id", nodeHandler.RemoveNode)
 		apiNodes.GET("/:id/health", nodeHandler.CheckNodeHealth)
+
+		// Mutation operations strictly protected by X-Admin-Key
+		mutationNodes := apiNodes.Group("")
+		mutationNodes.Use(middleware.RequireAdminKey(cfg.AdminAPIKey))
+		{
+			mutationNodes.POST("", nodeHandler.OnboardNode)
+			mutationNodes.DELETE("/:id", nodeHandler.RemoveNode)
+		}
 	}
 
 	serverAddr := fmt.Sprintf(":%s", cfg.Port)
@@ -121,7 +148,7 @@ func seedInitialNodes(ctx context.Context, repo repository.NodeRepository, geoSv
 		}
 
 		host := u.Hostname()
-		port := 8081
+		port := 22
 		if pStr := u.Port(); pStr != "" {
 			if p, parseErr := strconv.Atoi(pStr); parseErr == nil {
 				port = p
@@ -130,7 +157,7 @@ func seedInitialNodes(ctx context.Context, repo repository.NodeRepository, geoSv
 
 		locLower := strings.ToLower(n.Location)
 		coords := geoSvc.StorageLocations[locLower]
-		country := strings.Title(n.Location)
+		country := strings.ToUpper(n.Location[:1]) + strings.ToLower(n.Location[1:])
 
 		nodeID := fmt.Sprintf("node-%s", locLower)
 		now := time.Now().UTC()

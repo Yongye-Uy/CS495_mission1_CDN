@@ -4,23 +4,27 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 
 	"mini-cdn/api/models"
 	"mini-cdn/api/repository"
+	"mini-cdn/api/services/barrier"
 	"mini-cdn/api/services/geo"
-	"mini-cdn/api/services/storage_client"
+	"mini-cdn/api/services/ssh_client"
 )
 
-// MockStorageClient implements storage_client.StorageClient for unit tests.
+// MockStorageClient implements ssh_client.StorageClient for unit tests.
 type MockStorageClient struct {
 	mu           sync.Mutex
-	storedFiles  map[string]map[string][]byte // nodeURL -> fileID -> content
-	failingNodes map[string]bool              // nodeURL -> should fail
+	storedFiles  map[string]map[string][]byte // "host:port" -> fileID -> content
+	failingNodes map[string]bool              // "host:port" -> should fail
 }
 
 func NewMockStorageClient() *MockStorageClient {
@@ -30,170 +34,222 @@ func NewMockStorageClient() *MockStorageClient {
 	}
 }
 
-func (m *MockStorageClient) SetNodeFailing(nodeURL string, failing bool) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.failingNodes[nodeURL] = failing
+func (m *MockStorageClient) key(host string, port int) string {
+	return fmt.Sprintf("%s:%d", host, port)
 }
 
-func (m *MockStorageClient) Upload(ctx context.Context, nodeURL string, fileID string, filename string, r io.Reader) error {
+func (m *MockStorageClient) SetNodeFailing(host string, port int, failing bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.failingNodes[m.key(host, port)] = failing
+}
+
+func (m *MockStorageClient) Upload(ctx context.Context, host string, port int, fileID string, localFilePath string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if m.failingNodes[nodeURL] {
+	k := m.key(host, port)
+	if m.failingNodes[k] {
 		return errors.New("simulated storage failure")
 	}
 
-	data, err := io.ReadAll(r)
+	data, err := os.ReadFile(localFilePath)
 	if err != nil {
 		return err
 	}
 
-	if _, exists := m.storedFiles[nodeURL]; !exists {
-		m.storedFiles[nodeURL] = make(map[string][]byte)
+	if _, exists := m.storedFiles[k]; !exists {
+		m.storedFiles[k] = make(map[string][]byte)
 	}
-	m.storedFiles[nodeURL][fileID] = data
+	m.storedFiles[k][fileID] = data
 	return nil
 }
 
-func (m *MockStorageClient) Download(ctx context.Context, nodeURL string, fileID string) (io.ReadCloser, int64, string, error) {
+func (m *MockStorageClient) Download(ctx context.Context, host string, port int, fileID string) (io.ReadCloser, int64, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if m.failingNodes[nodeURL] {
-		return nil, 0, "", errors.New("simulated storage failure")
+	k := m.key(host, port)
+	if m.failingNodes[k] {
+		return nil, 0, errors.New("simulated storage failure")
 	}
 
-	nodeFiles, exists := m.storedFiles[nodeURL]
+	nodeFiles, exists := m.storedFiles[k]
 	if !exists {
-		return nil, 0, "", storage_client.ErrStorageNotFound
+		return nil, 0, ssh_client.ErrFileNotFound
 	}
 
 	data, exists := nodeFiles[fileID]
 	if !exists {
-		return nil, 0, "", storage_client.ErrStorageNotFound
+		return nil, 0, ssh_client.ErrFileNotFound
 	}
 
-	return io.NopCloser(bytes.NewReader(data)), int64(len(data)), "text/plain", nil
+	return io.NopCloser(bytes.NewReader(data)), int64(len(data)), nil
 }
 
-func (m *MockStorageClient) Delete(ctx context.Context, nodeURL string, fileID string) error {
+func (m *MockStorageClient) Delete(ctx context.Context, host string, port int, fileID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if m.failingNodes[nodeURL] {
+	k := m.key(host, port)
+	if m.failingNodes[k] {
 		return errors.New("simulated storage failure")
 	}
 
-	if nodeFiles, exists := m.storedFiles[nodeURL]; exists {
+	if nodeFiles, exists := m.storedFiles[k]; exists {
 		delete(nodeFiles, fileID)
 	}
 	return nil
 }
 
-func (m *MockStorageClient) Health(ctx context.Context, nodeURL string) (bool, string, error) {
+func (m *MockStorageClient) Health(ctx context.Context, host string, port int) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if m.failingNodes[nodeURL] {
-		return false, "", errors.New("node offline")
+	k := m.key(host, port)
+	if m.failingNodes[k] {
+		return false, errors.New("node offline")
 	}
-	return true, "mock-loc", nil
+	return true, nil
 }
 
-func TestFileService_UploadSingleNode(t *testing.T) {
+func (m *MockStorageClient) ListFiles(ctx context.Context, host string, port int) ([]string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	k := m.key(host, port)
+	var list []string
+	if nodeFiles, exists := m.storedFiles[k]; exists {
+		for f := range nodeFiles {
+			list = append(list, f)
+		}
+	}
+	return list, nil
+}
+
+func (m *MockStorageClient) StatFile(ctx context.Context, host string, port int, fileID string) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	k := m.key(host, port)
+	if nodeFiles, exists := m.storedFiles[k]; exists {
+		if data, ok := nodeFiles[fileID]; ok {
+			return int64(len(data)), nil
+		}
+	}
+	return 0, ssh_client.ErrFileNotFound
+}
+
+func TestFileService_Upload3of3Complete(t *testing.T) {
 	repo := repository.NewMockFileRepository()
 	nodeRepo := repository.NewMockNodeRepository()
+	journalRepo := repository.NewMockJournalRepository()
 	client := NewMockStorageClient()
 	geoSvc := geo.NewGeoService()
+	b := barrier.NewMutationBarrier()
+	stagingDir := filepath.Join(os.TempDir(), "test_staging_complete")
+	_ = os.MkdirAll(stagingDir, 0700)
+	defer os.RemoveAll(stagingDir)
 
 	nodes := []models.Replica{
-		{Location: "singapore", URL: "http://storage:8081"},
+		{Location: "singapore", URL: "sg:22"},
+		{Location: "newyork", URL: "ny:22"},
+		{Location: "london", URL: "london:22"},
 	}
 
-	svc := NewFileService(repo, nodeRepo, client, geoSvc, nodes)
+	svc := NewFileService(repo, nodeRepo, journalRepo, client, geoSvc, b, stagingDir, nodes)
 
-	content := "Hello single node storage"
+	content := "Hello 3/3 complete replication test"
 	meta, repStatus, err := svc.Upload(context.Background(), "test.txt", "text/plain", strings.NewReader(content), int64(len(content)))
 	if err != nil {
 		t.Fatalf("Upload failed: %v", err)
 	}
 
-	if !repStatus.Success {
-		t.Errorf("Expected replication success, got %v", repStatus)
+	// Verify status is COMPLETE when 3/3 replicas succeed
+	if repStatus.Success != true {
+		t.Errorf("Expected repStatus.Success to be true for 3/3, got false")
 	}
-	if len(repStatus.SuccessfulReplicas) != 1 || repStatus.SuccessfulReplicas[0] != "singapore" {
-		t.Errorf("Unexpected successful replicas: %+v", repStatus.SuccessfulReplicas)
+	if meta.ReplicationStatus != models.ReplicationStatusComplete {
+		t.Errorf("Expected status COMPLETE, got %s", meta.ReplicationStatus)
+	}
+	if len(repStatus.SuccessfulReplicas) != 3 {
+		t.Errorf("Expected 3 successful replicas, got %d", len(repStatus.SuccessfulReplicas))
 	}
 
-	// Verify MongoDB persistence
-	saved, err := repo.FindByID(context.Background(), meta.ID)
-	if err != nil {
-		t.Fatalf("Failed to find file in repo: %v", err)
-	}
-	if saved.OriginalName != "test.txt" || saved.Size != int64(len(content)) {
-		t.Errorf("Saved metadata mismatch: %+v", saved)
+	// Verify staged file is safely cleaned when COMPLETE
+	stagedPath := filepath.Join(stagingDir, meta.ID)
+	if _, err := os.Stat(stagedPath); !os.IsNotExist(err) {
+		t.Errorf("Expected local staged file to be cleaned up after 3/3 COMPLETE, but file still exists at %s", stagedPath)
 	}
 }
 
-func TestFileService_ReplicationStatusMultiNode(t *testing.T) {
+func TestFileService_ReplicationStatusPartialRetainsStaging(t *testing.T) {
 	repo := repository.NewMockFileRepository()
 	nodeRepo := repository.NewMockNodeRepository()
+	journalRepo := repository.NewMockJournalRepository()
 	client := NewMockStorageClient()
 	geoSvc := geo.NewGeoService()
+	b := barrier.NewMutationBarrier()
+	stagingDir := filepath.Join(os.TempDir(), "test_staging_partial")
+	_ = os.MkdirAll(stagingDir, 0700)
+	defer os.RemoveAll(stagingDir)
 
 	nodes := []models.Replica{
-		{Location: "singapore", URL: "http://sg:8081"},
-		{Location: "newyork", URL: "http://ny:8081"},
-		{Location: "london", URL: "http://london:8081"},
+		{Location: "singapore", URL: "sg:22"},
+		{Location: "newyork", URL: "ny:22"},
+		{Location: "london", URL: "london:22"},
 	}
 
 	// Simulate London failure
-	client.SetNodeFailing("http://london:8081", true)
+	client.SetNodeFailing("london", 22, true)
 
-	svc := NewFileService(repo, nodeRepo, client, geoSvc, nodes)
+	svc := NewFileService(repo, nodeRepo, journalRepo, client, geoSvc, b, stagingDir, nodes)
 
-	content := "Replication test data"
-	meta, repStatus, err := svc.Upload(context.Background(), "multi.pdf", "application/pdf", strings.NewReader(content), int64(len(content)))
+	content := "Partial replication data"
+	meta, repStatus, err := svc.Upload(context.Background(), "partial.pdf", "application/pdf", strings.NewReader(content), int64(len(content)))
 	if err != nil {
-		t.Fatalf("Upload should not have returned error for partial failure: %v", err)
+		t.Fatalf("Upload should succeed with PARTIAL status, got: %v", err)
 	}
 
+	// 2/3 is PARTIAL, not complete!
 	if repStatus.Success {
 		t.Errorf("Expected repStatus.Success to be false due to failed London node")
 	}
-
-	if len(repStatus.FailedReplicas) != 1 || repStatus.FailedReplicas[0] != "london" {
-		t.Errorf("Expected failed replica 'london', got %+v", repStatus.FailedReplicas)
+	if meta.ReplicationStatus != models.ReplicationStatusPartial {
+		t.Errorf("Expected status PARTIAL, got %s", meta.ReplicationStatus)
+	}
+	if !meta.QuorumMet {
+		t.Errorf("Expected QuorumMet to be true for 2/3 replicas")
+	}
+	if len(meta.Replicas) != 2 {
+		t.Errorf("Expected exactly 2 replicas recorded in metadata, got %d", len(meta.Replicas))
 	}
 
-	if len(repStatus.SuccessfulReplicas) != 2 {
-		t.Errorf("Expected 2 successful replicas, got %+v", repStatus.SuccessfulReplicas)
-	}
-
-	// Check metadata stored only successful replicas
-	saved, err := repo.FindByID(context.Background(), meta.ID)
-	if err != nil {
-		t.Fatalf("Metadata should be stored: %v", err)
-	}
-	if len(saved.Replicas) != 2 {
-		t.Errorf("Expected 2 saved replicas in metadata, got %d", len(saved.Replicas))
+	// CRITICAL: Staged file must be retained on disk for recovery!
+	stagedPath := filepath.Join(stagingDir, meta.ID)
+	if _, err := os.Stat(stagedPath); os.IsNotExist(err) {
+		t.Errorf("Staged file MUST be retained when replication is PARTIAL, but file was deleted!")
 	}
 }
 
 func TestFileService_NearestServerAndFallback(t *testing.T) {
 	repo := repository.NewMockFileRepository()
 	nodeRepo := repository.NewMockNodeRepository()
+	journalRepo := repository.NewMockJournalRepository()
 	client := NewMockStorageClient()
 	geoSvc := geo.NewGeoService()
+	b := barrier.NewMutationBarrier()
+	stagingDir := filepath.Join(os.TempDir(), "test_staging_geo")
+	_ = os.MkdirAll(stagingDir, 0700)
+	defer os.RemoveAll(stagingDir)
 
 	nodes := []models.Replica{
-		{Location: "singapore", URL: "http://sg:8081"},
-		{Location: "newyork", URL: "http://ny:8081"},
-		{Location: "london", URL: "http://london:8081"},
+		{Location: "singapore", URL: "sg:22"},
+		{Location: "newyork", URL: "ny:22"},
+		{Location: "london", URL: "london:22"},
 	}
 
-	svc := NewFileService(repo, nodeRepo, client, geoSvc, nodes)
+	svc := NewFileService(repo, nodeRepo, journalRepo, client, geoSvc, b, stagingDir, nodes)
 
 	content := "Test content for geolocation download"
 	meta, _, err := svc.Upload(context.Background(), "geo.txt", "text/plain", strings.NewReader(content), int64(len(content)))
@@ -215,10 +271,9 @@ func TestFileService_NearestServerAndFallback(t *testing.T) {
 		t.Errorf("Expected served by singapore, got %s", servedBy)
 	}
 
-	// 2. Simulate Singapore node failure
-	client.SetNodeFailing("http://sg:8081", true)
+	// 2. Simulate Singapore node failure -> fallback to London (~9970km vs NY ~15000km)
+	client.SetNodeFailing("sg", 22, true)
 
-	// Now Cambodia client tries again -> Singapore fails, fallback to next nearest (London ~9970km vs NY ~15000km)
 	streamFallback, _, servedByFallback, err := svc.GetFileStream(context.Background(), meta.ID, reqKH)
 	if err != nil {
 		t.Fatalf("GetFileStream should succeed via fallback: %v", err)
@@ -233,15 +288,21 @@ func TestFileService_NearestServerAndFallback(t *testing.T) {
 func TestFileService_Delete(t *testing.T) {
 	repo := repository.NewMockFileRepository()
 	nodeRepo := repository.NewMockNodeRepository()
+	journalRepo := repository.NewMockJournalRepository()
 	client := NewMockStorageClient()
 	geoSvc := geo.NewGeoService()
+	b := barrier.NewMutationBarrier()
+	stagingDir := filepath.Join(os.TempDir(), "test_staging_del")
+	_ = os.MkdirAll(stagingDir, 0700)
+	defer os.RemoveAll(stagingDir)
 
 	nodes := []models.Replica{
-		{Location: "singapore", URL: "http://sg:8081"},
-		{Location: "newyork", URL: "http://ny:8081"},
+		{Location: "singapore", URL: "sg:22"},
+		{Location: "newyork", URL: "ny:22"},
+		{Location: "london", URL: "london:22"},
 	}
 
-	svc := NewFileService(repo, nodeRepo, client, geoSvc, nodes)
+	svc := NewFileService(repo, nodeRepo, journalRepo, client, geoSvc, b, stagingDir, nodes)
 
 	content := "Delete target"
 	meta, _, err := svc.Upload(context.Background(), "del.txt", "text/plain", strings.NewReader(content), int64(len(content)))
@@ -255,9 +316,15 @@ func TestFileService_Delete(t *testing.T) {
 		t.Fatalf("Delete failed: %v", err)
 	}
 
-	// Verify metadata removed
+	// Verify metadata marked as deleted
 	_, err = repo.FindByID(context.Background(), meta.ID)
 	if err != repository.ErrNotFound {
 		t.Errorf("Expected ErrNotFound after deletion, got %v", err)
+	}
+
+	// Verify deleted from remote storage nodes
+	_, _, err = client.Download(context.Background(), "sg", 22, meta.ID)
+	if err != ssh_client.ErrFileNotFound {
+		t.Errorf("Expected ErrFileNotFound on node after SFTP delete, got: %v", err)
 	}
 }

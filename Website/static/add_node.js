@@ -9,11 +9,18 @@ function fillPreset(ip, port, region, country, lat, lon) {
   if (submitBtn) submitBtn.disabled = false;
 
   document.getElementById("nodeIP").value = ip;
-  document.getElementById("nodePort").value = port;
-  document.getElementById("nodeRegion").value = region;
-  document.getElementById("nodeCountry").value = country;
-  document.getElementById("nodeLat").value = lat;
-  document.getElementById("nodeLon").value = lon;
+  if (port) document.getElementById("nodePort").value = port;
+  if (region) document.getElementById("nodeRegion").value = region;
+  if (country) document.getElementById("nodeCountry").value = country;
+  if (lat) document.getElementById("nodeLat").value = lat;
+  if (lon) document.getElementById("nodeLon").value = lon;
+
+  // Expand accordion to show prefilled settings
+  const collapseEl = document.getElementById("collapseAdv");
+  if (collapseEl && window.bootstrap && window.bootstrap.Collapse) {
+    const bsCollapse = bootstrap.Collapse.getOrCreateInstance(collapseEl, { toggle: false });
+    bsCollapse.show();
+  }
 }
 
 document.addEventListener("DOMContentLoaded", function () {
@@ -23,18 +30,21 @@ document.addEventListener("DOMContentLoaded", function () {
   const progressAlert = document.getElementById("progressAlert");
   const progressSpinner = document.getElementById("progressSpinner");
 
+  if (!form) return;
+
   form.addEventListener("submit", async function (e) {
     e.preventDefault();
 
     const ip = document.getElementById("nodeIP").value.trim();
-    const port = parseInt(document.getElementById("nodePort").value, 10) || 8081;
+    const port = parseInt(document.getElementById("nodePort").value, 10) || 22;
     const region = document.getElementById("nodeRegion").value.trim();
     const country = document.getElementById("nodeCountry").value.trim();
     const lat = parseFloat(document.getElementById("nodeLat").value) || 0;
     const lon = parseFloat(document.getElementById("nodeLon").value) || 0;
+    const csrfToken = document.getElementById("csrfToken")?.value || getCookie("cdn_csrf_token");
 
-    if (!ip || !region) {
-      alert("IP Address and Region are required.");
+    if (!ip) {
+      alert("Storage Server IP Address or Hostname is required.");
       return;
     }
 
@@ -43,8 +53,8 @@ document.addEventListener("DOMContentLoaded", function () {
     progressAlert.classList.add("d-none");
     resetSteps();
 
-    // Step 1: Contacting
-    setStepActive("step1", "Step 1: Contacting storage worker at " + escapeHTML(ip) + ":" + port + "...");
+    // Step 1: Connecting
+    setStepActive("step1", "Step 1: Connecting via SSH with strict host-key verification...");
 
     try {
       const payload = {
@@ -56,56 +66,73 @@ document.addEventListener("DOMContentLoaded", function () {
         longitude: lon,
       };
 
-      // Step 2 & 3
-      setTimeout(() => {
-        setStepDone("step1", "Step 1: Contacted storage worker.");
-        setStepActive("step2", "Step 2: Verifying worker identity & /health status...");
-      }, 500);
+      const stepTimer1 = setTimeout(() => {
+        setStepDone("step1", "Step 1: Host key verified. cdn-sync authenticated.");
+        setStepActive("step2", "Step 2: Checking storage directory (/var/cdn/data) permissions...");
+      }, 600);
 
-      setTimeout(() => {
-        setStepDone("step2", "Step 2: Worker verified (valid storage service).");
-        setStepActive("step3", "Step 3: Creating PENDING record in MongoDB...");
-      }, 1000);
+      const stepTimer2 = setTimeout(() => {
+        setStepDone("step2", "Step 2: Storage directory verified healthy.");
+        setStepActive("step3", "Step 3: Creating PENDING record & capturing sync snapshot in MongoDB...");
+      }, 1200);
+
+      const headers = {
+        "Content-Type": "application/json",
+      };
+      if (csrfToken) {
+        headers["X-CSRF-Token"] = csrfToken;
+      }
 
       const res = await fetch("/nodes/add", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: headers,
         body: JSON.stringify(payload),
       });
+
+      clearTimeout(stepTimer1);
+      clearTimeout(stepTimer2);
 
       const data = await res.json().catch(() => ({}));
 
       if (!res.ok) {
         progressSpinner.classList.add("d-none");
         const errMsg = data.error || `HTTP ${res.status}`;
-        setStepError("step2", "Worker verification / registration failed.");
-        showProgressAlert(`<strong>Node registration failed.</strong><br>Reason: ${escapeHTML(errMsg)}`, "danger");
+        if (res.status === 401) {
+          showProgressAlert(`<strong>Authentication Required.</strong> Your session has expired. Redirecting to login...`, "warning");
+          setTimeout(() => { window.location.href = "/admin/login?next=/nodes/add"; }, 1500);
+          return;
+        }
+
+        setStepError("step1", "Onboarding validation or synchronization failed.");
+        showProgressAlert(`<strong>Node onboarding rejected:</strong><br>${escapeHTML(errMsg)}`, "danger");
         submitBtn.disabled = false;
         return;
       }
 
       // Success sequence
-      setStepDone("step3", "Step 3: Node registered in MongoDB (storage_nodes).");
-      setStepActive("step4", "Step 4: Synchronizing existing data via rsync...");
+      setStepDone("step1", "Step 1: Host key verified. cdn-sync authenticated.");
+      setStepDone("step2", "Step 2: Storage directory /var/cdn/data verified.");
+      setStepDone("step3", "Step 3: Initialized sync job and catalog snapshot.");
+      setStepActive("step4", "Step 4: Transferred catalog files & replaying mutation journal...");
 
       setTimeout(() => {
-        setStepDone("step4", "Step 4: rsync synchronization complete.");
-        setStepDone("step5", "Step 5: Node activated to ONLINE!");
+        setStepDone("step4", "Step 4: Catalog synchronized and mutations replayed.");
+        setStepDone("step5", "Step 5: Mutation barrier passed! Node activated to ONLINE.");
         progressSpinner.classList.add("d-none");
 
         showProgressAlert(
-          `<strong>Success!</strong> Node <code>${escapeHTML(data.node?.nodeId || ip)}</code> is now ONLINE.<br>Redirecting to Storage Nodes list...`,
+          `<strong>Success!</strong> Node <code>${escapeHTML(data.node?.nodeId || ip)}</code> is fully synchronized and <strong>ONLINE</strong>.<br>Redirecting to Storage Nodes list...`,
           "success"
         );
 
         setTimeout(() => {
           window.location.href = "/nodes";
-        }, 2200);
+        }, 1800);
       }, 600);
 
     } catch (err) {
       progressSpinner.classList.add("d-none");
-      setStepError("step1", "Network error contacting Central API.");
+      setStepError("step1", "Network error contacting Website server.");
       showProgressAlert(`<strong>Error:</strong> ${escapeHTML(err.message)}`, "danger");
       submitBtn.disabled = false;
     }
@@ -147,6 +174,13 @@ document.addEventListener("DOMContentLoaded", function () {
     progressAlert.className = `alert alert-${type} mt-3 mb-0 small`;
     progressAlert.innerHTML = html;
     progressAlert.classList.remove("d-none");
+  }
+
+  function getCookie(name) {
+    const value = `; ${document.cookie}`;
+    const parts = value.split(`; ${name}=`);
+    if (parts.length === 2) return parts.pop().split(';').shift();
+    return "";
   }
 
   function escapeHTML(str) {

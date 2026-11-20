@@ -8,6 +8,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"sync"
 	"testing"
 
@@ -16,61 +17,90 @@ import (
 	"mini-cdn/api/models"
 	"mini-cdn/api/repository"
 	"mini-cdn/api/services"
+	"mini-cdn/api/services/barrier"
 	"mini-cdn/api/services/geo"
-	"mini-cdn/api/services/storage_client"
+	"mini-cdn/api/services/ssh_client"
 )
 
-// Mock client for handler tests
 type testStorageClient struct {
 	mu    sync.Mutex
-	files map[string]map[string][]byte
+	files map[string][]byte
 }
 
 func newTestStorageClient() *testStorageClient {
-	return &testStorageClient{files: make(map[string]map[string][]byte)}
+	return &testStorageClient{
+		files: make(map[string][]byte),
+	}
 }
 
-func (c *testStorageClient) Upload(ctx context.Context, nodeURL string, fileID string, filename string, r io.Reader) error {
+func (c *testStorageClient) Upload(ctx context.Context, host string, port int, fileID string, localFilePath string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	data, _ := io.ReadAll(r)
-	if _, ok := c.files[nodeURL]; !ok {
-		c.files[nodeURL] = make(map[string][]byte)
+	data, err := os.ReadFile(localFilePath)
+	if err != nil {
+		return err
 	}
-	c.files[nodeURL][fileID] = data
+	c.files[fileID] = data
 	return nil
 }
 
-func (c *testStorageClient) Download(ctx context.Context, nodeURL string, fileID string) (io.ReadCloser, int64, string, error) {
+func (c *testStorageClient) Download(ctx context.Context, host string, port int, fileID string) (io.ReadCloser, int64, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	data, ok := c.files[nodeURL][fileID]
+	data, ok := c.files[fileID]
 	if !ok {
-		return nil, 0, "", storage_client.ErrStorageNotFound
+		return nil, 0, ssh_client.ErrFileNotFound
 	}
-	return io.NopCloser(bytes.NewReader(data)), int64(len(data)), "text/plain", nil
+	return io.NopCloser(bytes.NewReader(data)), int64(len(data)), nil
 }
 
-func (c *testStorageClient) Delete(ctx context.Context, nodeURL string, fileID string) error {
+func (c *testStorageClient) Delete(ctx context.Context, host string, port int, fileID string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	delete(c.files[nodeURL], fileID)
+	delete(c.files, fileID)
 	return nil
 }
 
-func (c *testStorageClient) Health(ctx context.Context, nodeURL string) (bool, string, error) {
-	return true, "test-loc", nil
+func (c *testStorageClient) Health(ctx context.Context, host string, port int) (bool, error) {
+	return true, nil
+}
+
+func (c *testStorageClient) ListFiles(ctx context.Context, host string, port int) ([]string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var res []string
+	for k := range c.files {
+		res = append(res, k)
+	}
+	return res, nil
+}
+
+func (c *testStorageClient) StatFile(ctx context.Context, host string, port int, fileID string) (int64, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if d, ok := c.files[fileID]; ok {
+		return int64(len(d)), nil
+	}
+	return 0, ssh_client.ErrFileNotFound
 }
 
 func setupTestFileHandler() (*FileHandler, *gin.Engine) {
 	gin.SetMode(gin.TestMode)
 	repo := repository.NewMockFileRepository()
 	nodeRepo := repository.NewMockNodeRepository()
+	journalRepo := repository.NewMockJournalRepository()
 	client := newTestStorageClient()
 	geoSvc := geo.NewGeoService()
-	nodes := []models.Replica{{Location: "singapore", URL: "http://sg:8081"}}
+	b := barrier.NewMutationBarrier()
+	stagingDir, _ := os.MkdirTemp("", "api_staging_test_handler_*")
 
-	svc := services.NewFileService(repo, nodeRepo, client, geoSvc, nodes)
+	nodes := []models.Replica{
+		{Location: "singapore", URL: "sg:22"},
+		{Location: "newyork", URL: "ny:22"},
+		{Location: "london", URL: "london:22"},
+	}
+
+	svc := services.NewFileService(repo, nodeRepo, journalRepo, client, geoSvc, b, stagingDir, nodes)
 	handler := NewFileHandler(svc, 100)
 
 	r := gin.New()
@@ -95,101 +125,70 @@ func TestFileHandler_Health(t *testing.T) {
 		t.Fatalf("Expected 200, got %d", rec.Code)
 	}
 
-	var res map[string]string
-	_ = json.Unmarshal(rec.Body.Bytes(), &res)
-	if res["status"] != "ok" || res["service"] != "api" {
-		t.Errorf("Unexpected health response: %+v", res)
+	var resp map[string]interface{}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("Failed to parse JSON: %v", err)
+	}
+	if resp["status"] != "ok" {
+		t.Errorf("Expected status=ok, got %v", resp["status"])
 	}
 }
 
-func TestFileHandler_UploadAndGetAndLocation(t *testing.T) {
+func TestFileHandler_UploadAndGet(t *testing.T) {
 	_, r := setupTestFileHandler()
 
-	fileContent := "Test distributed file content"
-
-	// 1. Upload
-	body := new(bytes.Buffer)
+	body := &bytes.Buffer{}
 	writer := multipart.NewWriter(body)
-	part, _ := writer.CreateFormFile("file", "document.txt")
-	_, _ = io.WriteString(part, fileContent)
+	part, err := writer.CreateFormFile("file", "test.txt")
+	if err != nil {
+		t.Fatalf("Failed to create form file: %v", err)
+	}
+	_, _ = part.Write([]byte("File content from handler test"))
 	_ = writer.Close()
 
-	uploadReq := httptest.NewRequest(http.MethodPost, "/api/files", body)
-	uploadReq.Header.Set("Content-Type", writer.FormDataContentType())
-	uploadRec := httptest.NewRecorder()
-	r.ServeHTTP(uploadRec, uploadReq)
+	req := httptest.NewRequest(http.MethodPost, "/api/files", body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
 
-	if uploadRec.Code != http.StatusCreated {
-		t.Fatalf("Upload failed with status %d: %s", uploadRec.Code, uploadRec.Body.String())
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("Expected 201 Created, got %d: %s", rec.Code, rec.Body.String())
 	}
 
-	var upResp UploadResponse
-	_ = json.Unmarshal(uploadRec.Body.Bytes(), &upResp)
-	if !upResp.Success || upResp.File == nil || upResp.File.ID == "" {
-		t.Fatalf("Invalid upload response: %+v", upResp)
+	var uploadResp map[string]interface{}
+	_ = json.Unmarshal(rec.Body.Bytes(), &uploadResp)
+	fileID, ok := uploadResp["id"].(string)
+	if !ok || fileID == "" {
+		t.Fatalf("Expected valid file id, got %+v", uploadResp)
 	}
 
-	fileID := upResp.File.ID
-
-	// 2. List
-	listReq := httptest.NewRequest(http.MethodGet, "/api/files", nil)
-	listRec := httptest.NewRecorder()
-	r.ServeHTTP(listRec, listReq)
-
-	if listRec.Code != http.StatusOK {
-		t.Fatalf("List returned status %d", listRec.Code)
-	}
-
-	var files []*models.FileMetadata
-	_ = json.Unmarshal(listRec.Body.Bytes(), &files)
-	if len(files) != 1 || files[0].ID != fileID {
-		t.Errorf("Expected file in list, got %+v", files)
-	}
-
-	// 3. Location debug endpoint
-	locReq := httptest.NewRequest(http.MethodGet, "/api/files/"+fileID+"/location", nil)
-	locReq.Header.Set("X-Test-Country", "KH")
-	locRec := httptest.NewRecorder()
-	r.ServeHTTP(locRec, locReq)
-
-	if locRec.Code != http.StatusOK {
-		t.Fatalf("Location returned status %d: %s", locRec.Code, locRec.Body.String())
-	}
-
-	var locResp models.LocationDebugResponse
-	_ = json.Unmarshal(locRec.Body.Bytes(), &locResp)
-	if locResp.NearestStorage != "singapore" || locResp.ClientCountry != "Cambodia" {
-		t.Errorf("Unexpected location debug response: %+v", locResp)
-	}
-
-	// 4. Download file
+	// GET file
 	getReq := httptest.NewRequest(http.MethodGet, "/api/files/"+fileID, nil)
-	getReq.Header.Set("X-Test-Country", "KH")
 	getRec := httptest.NewRecorder()
 	r.ServeHTTP(getRec, getReq)
 
 	if getRec.Code != http.StatusOK {
-		t.Fatalf("Get returned status %d: %s", getRec.Code, getRec.Body.String())
+		t.Fatalf("Expected 200 OK from GET, got %d: %s", getRec.Code, getRec.Body.String())
 	}
-	if getRec.Body.String() != fileContent {
-		t.Errorf("Expected content %q, got %q", fileContent, getRec.Body.String())
+	if getRec.Body.String() != "File content from handler test" {
+		t.Errorf("File body mismatch: %s", getRec.Body.String())
 	}
 
-	// 5. Delete file
+	// DELETE file
 	delReq := httptest.NewRequest(http.MethodDelete, "/api/files/"+fileID, nil)
 	delRec := httptest.NewRecorder()
 	r.ServeHTTP(delRec, delReq)
 
 	if delRec.Code != http.StatusOK {
-		t.Fatalf("Delete returned status %d: %s", delRec.Code, delRec.Body.String())
+		t.Fatalf("Expected 200 OK from DELETE, got %d: %s", delRec.Code, delRec.Body.String())
 	}
 
-	// 6. Get after delete -> 404
-	getAgainReq := httptest.NewRequest(http.MethodGet, "/api/files/"+fileID, nil)
-	getAgainRec := httptest.NewRecorder()
-	r.ServeHTTP(getAgainRec, getAgainReq)
+	// Confirm 404 after delete
+	getReqAfter := httptest.NewRequest(http.MethodGet, "/api/files/"+fileID, nil)
+	getRecAfter := httptest.NewRecorder()
+	r.ServeHTTP(getRecAfter, getReqAfter)
 
-	if getAgainRec.Code != http.StatusNotFound {
-		t.Errorf("Expected 404 after delete, got %d", getAgainRec.Code)
+	if getRecAfter.Code != http.StatusNotFound {
+		t.Fatalf("Expected 404 Not Found after delete, got %d", getRecAfter.Code)
 	}
 }

@@ -16,19 +16,13 @@ import (
 	"mini-cdn/api/models"
 	"mini-cdn/api/repository"
 	"mini-cdn/api/services/geo"
+	"mini-cdn/api/services/ssh_client"
 )
 
 var (
-	ErrWorkerUnreachable = errors.New("worker is unreachable or invalid storage service")
+	ErrWorkerUnreachable = errors.New("storage node unreachable via SSH or invalid storage directory")
 	ErrDuplicateNode     = errors.New("storage node with this IP and port is already registered")
 )
-
-type WorkerHealthResponse struct {
-	Status   string `json:"status"`
-	Service  string `json:"service"`
-	NodeID   string `json:"nodeId"`
-	Location string `json:"location"`
-}
 
 type RegisterNodeParams struct {
 	IP        string  `json:"ip"`
@@ -40,20 +34,22 @@ type RegisterNodeParams struct {
 }
 
 type NodeService struct {
-	repo        repository.NodeRepository
-	syncService *SyncService
-	fileRepo    repository.FileRepository
-	geoService  *geo.GeoService
-	httpClient  *http.Client
+	repo          repository.NodeRepository
+	syncService   *SyncService
+	fileRepo      repository.FileRepository
+	geoService    *geo.GeoService
+	storageClient ssh_client.StorageClient
 }
 
-func NewNodeService(repo repository.NodeRepository, syncService *SyncService) *NodeService {
+func NewNodeService(
+	repo repository.NodeRepository,
+	syncService *SyncService,
+	storageClient ssh_client.StorageClient,
+) *NodeService {
 	return &NodeService{
-		repo:        repo,
-		syncService: syncService,
-		httpClient: &http.Client{
-			Timeout: 5 * time.Second,
-		},
+		repo:          repo,
+		syncService:   syncService,
+		storageClient: storageClient,
 	}
 }
 
@@ -65,13 +61,11 @@ func (s *NodeService) SetGeoService(geoService *geo.GeoService) {
 	s.geoService = geoService
 }
 
-// OnboardNode executes the 6-step verification and registration pipeline:
+// OnboardNode executes the verification, persistent registration, and two-phase synchronization:
 // 1. Validate request
-// 2. Check duplicate node
-// 3. Health check worker
-// 4. Create node as PENDING
-// 5. If existing nodes have data -> SYNCING -> rsync
-// 6. Set status = ONLINE
+// 2. SSH health & host-key check
+// 3. Create node in PENDING state
+// 4. Delegate to SyncService (Two-phase journal replay + final barrier)
 func (s *NodeService) OnboardNode(ctx context.Context, params RegisterNodeParams) (*models.StorageNode, error) {
 	ip := strings.TrimSpace(params.IP)
 	if ip == "" {
@@ -80,7 +74,7 @@ func (s *NodeService) OnboardNode(ctx context.Context, params RegisterNodeParams
 
 	port := params.Port
 	if port <= 0 {
-		port = 8081
+		port = 22
 	}
 
 	region := strings.TrimSpace(params.Region)
@@ -93,56 +87,20 @@ func (s *NodeService) OnboardNode(ctx context.Context, params RegisterNodeParams
 		country = region
 	}
 
-	// 2. Health check worker (with simulated environment fallbacks for Docker local testing)
-	effectiveIP := ip
-	effectivePort := port
-	health, err := s.probeWorkerHealth(ctx, effectiveIP, effectivePort)
-	if err != nil {
-		// If testing locally in Docker, 127.0.0.1, localhost, 198.45.98.44 (assignment spec IP)
-		// might need to resolve to the Docker worker container 'storage-new-node:8081'
-		fallbackCandidates := []struct {
-			ip   string
-			port int
-		}{
-			{"storage-new-node", 8081},
-			{"host.docker.internal", port},
-		}
-
-		lowerIP := strings.ToLower(ip)
-		isLocalOrSpec := lowerIP == "127.0.0.1" || lowerIP == "localhost" || lowerIP == "198.45.98.44"
-
-		if isLocalOrSpec {
-			for _, fb := range fallbackCandidates {
-				if fbHealth, fbErr := s.probeWorkerHealth(ctx, fb.ip, fb.port); fbErr == nil {
-					log.Printf("[NODE_MGR] Simulated environment fallback: mapped requested %s:%d to accessible worker %s:%d (NodeID: %s)",
-						ip, port, fb.ip, fb.port, fbHealth.NodeID)
-					effectiveIP = fb.ip
-					effectivePort = fb.port
-					health = fbHealth
-					err = nil
-					break
-				}
-			}
-		}
-	}
-
-	if err != nil {
-		log.Printf("[NODE_MGR] Worker health check failed for %s:%d: %v", ip, port, err)
+	// 1. Health check worker via strict SSH
+	healthy, err := s.probeWorkerHealth(ctx, ip, port)
+	if err != nil || !healthy {
+		log.Printf("[NODE_MGR] SSH storage health check failed for %s:%d: %v", ip, port, err)
 		return nil, fmt.Errorf("%w: %v", ErrWorkerUnreachable, err)
 	}
 
-	// Check duplicate
-	existing, _ := s.repo.FindByIPAndPort(ctx, effectiveIP, effectivePort)
+	// 2. Check duplicate
+	existing, _ := s.repo.FindByIPAndPort(ctx, ip, port)
 	if existing != nil {
 		return nil, ErrDuplicateNode
 	}
 
-	nodeID := health.NodeID
-	if nodeID == "" {
-		nodeID = fmt.Sprintf("node-%s-%d", strings.ToLower(region), effectivePort)
-	}
-
-	// Ensure unique NodeID
+	nodeID := fmt.Sprintf("node-%s-%d", strings.ToLower(region), port)
 	if n, _ := s.repo.FindByNodeID(ctx, nodeID); n != nil {
 		nodeID = fmt.Sprintf("%s-%s", nodeID, uuid.New().String()[:6])
 	}
@@ -150,7 +108,7 @@ func (s *NodeService) OnboardNode(ctx context.Context, params RegisterNodeParams
 	lat := params.Latitude
 	lon := params.Longitude
 	if lat == 0 && lon == 0 {
-		if cName, rName, ipLat, ipLon, err := s.lookupIPGeo(effectiveIP); err == nil && (ipLat != 0 || ipLon != 0) {
+		if cName, rName, ipLat, ipLon, err := s.lookupIPGeo(ip); err == nil && (ipLat != 0 || ipLon != 0) {
 			lat = ipLat
 			lon = ipLon
 			if country == "" || country == "Unknown" || country == "Auto" {
@@ -183,8 +141,8 @@ func (s *NodeService) OnboardNode(ctx context.Context, params RegisterNodeParams
 	node := &models.StorageNode{
 		ID:            uuid.New().String(),
 		NodeID:        nodeID,
-		IP:            effectiveIP,
-		Port:          effectivePort,
+		IP:            ip,
+		Port:          port,
 		Region:        region,
 		Country:       country,
 		Latitude:      lat,
@@ -194,49 +152,33 @@ func (s *NodeService) OnboardNode(ctx context.Context, params RegisterNodeParams
 		CreatedAt:     now,
 	}
 
-	// 4. Insert as PENDING
+	// 3. Save as PENDING
 	if err := s.repo.Create(ctx, node); err != nil {
 		return nil, fmt.Errorf("failed to save node to repository: %w", err)
 	}
 
-	log.Printf("[NODE_MGR] Node %s (%s:%d) created in PENDING state", node.NodeID, node.IP, node.Port)
+	log.Printf("[NODE_MGR] Node %s (%s:%d) saved in PENDING state. Starting synchronization...", node.NodeID, node.IP, node.Port)
 
-	// 5. Determine source storage node for synchronization
-	onlineNodes, err := s.repo.FindOnline(ctx)
-	if err == nil && len(onlineNodes) > 0 {
-		var sourceNode *models.StorageNode
-		for _, n := range onlineNodes {
-			if n.ID != node.ID && n.NodeID != node.NodeID {
-				sourceNode = n
-				break
-			}
+	// 4. Delegate to SyncService for Two-Phase Sync & Barrier Activation
+	if s.syncService != nil {
+		if err := s.syncService.OnboardAndSynchronize(ctx, node); err != nil {
+			log.Printf("[NODE_MGR] Synchronization failed for node %s: %v", node.NodeID, err)
+			return node, fmt.Errorf("node registered but data synchronization failed: %w", err)
 		}
-
-		if sourceNode != nil {
-			log.Printf("[NODE_MGR] Found source node %s. Setting status to SYNCING...", sourceNode.NodeID)
-			_ = s.repo.UpdateStatus(ctx, node.ID, models.NodeStatusSyncing)
-			node.Status = models.NodeStatusSyncing
-
-			syncErr := s.syncService.Synchronize(ctx, sourceNode, node)
-			if syncErr != nil {
-				log.Printf("[NODE_MGR] Sync failed for node %s: %v. Setting status to ERROR", node.NodeID, syncErr)
-				_ = s.repo.UpdateStatus(ctx, node.ID, models.NodeStatusError)
-				node.Status = models.NodeStatusError
-				return node, fmt.Errorf("node registered but data synchronization failed: %w", syncErr)
-			}
-			log.Printf("[NODE_MGR] Synchronization complete for node %s", node.NodeID)
-			s.updateFileReplicasAfterSync(ctx, node)
-		}
+	} else {
+		_ = s.repo.UpdateStatus(ctx, node.ID, models.NodeStatusOnline)
 	}
 
-	// 6. Set status = ONLINE
-	if err := s.repo.UpdateStatus(ctx, node.ID, models.NodeStatusOnline); err != nil {
-		return nil, fmt.Errorf("failed to activate node to ONLINE: %w", err)
-	}
 	node.Status = models.NodeStatusOnline
-
 	log.Printf("[NODE_MGR] Node %s successfully onboarded and activated (ONLINE)", node.NodeID)
 	return node, nil
+}
+
+func (s *NodeService) probeWorkerHealth(ctx context.Context, ip string, port int) (bool, error) {
+	if s.storageClient == nil {
+		return true, nil
+	}
+	return s.storageClient.Health(ctx, ip, port)
 }
 
 func (s *NodeService) lookupIPGeo(ip string) (string, string, float64, float64, error) {
@@ -270,42 +212,6 @@ func (s *NodeService) lookupIPGeo(ip string) (string, string, float64, float64, 
 	return res.CountryName, region, res.Latitude, res.Longitude, nil
 }
 
-func (s *NodeService) probeWorkerHealth(ctx context.Context, ip string, port int) (*WorkerHealthResponse, error) {
-	var url string
-	if port == 80 || port == 0 {
-		url = fmt.Sprintf("http://%s/health", ip)
-	} else if port == 443 {
-		url = fmt.Sprintf("https://%s/health", ip)
-	} else {
-		url = fmt.Sprintf("http://%s:%d/health", ip, port)
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	resp, err := s.httpClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("HTTP status %d", resp.StatusCode)
-	}
-
-	var health WorkerHealthResponse
-	if err := json.NewDecoder(resp.Body).Decode(&health); err != nil {
-		return nil, fmt.Errorf("invalid json response: %w", err)
-	}
-
-	if health.Status != "ok" || health.Service != "storage" {
-		return nil, fmt.Errorf("unexpected health payload: status=%s, service=%s", health.Status, health.Service)
-	}
-
-	return &health, nil
-}
-
 func (s *NodeService) GetAllNodes(ctx context.Context) ([]*models.StorageNode, error) {
 	return s.repo.FindAll(ctx)
 }
@@ -328,9 +234,9 @@ func (s *NodeService) CheckNodeHealth(ctx context.Context, id string) (*models.S
 		return nil, err
 	}
 
-	health, probeErr := s.probeWorkerHealth(ctx, node.IP, node.Port)
+	healthy, probeErr := s.probeWorkerHealth(ctx, node.IP, node.Port)
 	now := time.Now().UTC()
-	if probeErr != nil {
+	if probeErr != nil || !healthy {
 		_ = s.repo.UpdateHeartbeat(ctx, node.ID, models.NodeStatusOffline, now)
 		node.Status = models.NodeStatusOffline
 		return node, probeErr
@@ -339,9 +245,6 @@ func (s *NodeService) CheckNodeHealth(ctx context.Context, id string) (*models.S
 	_ = s.repo.UpdateHeartbeat(ctx, node.ID, models.NodeStatusOnline, now)
 	node.Status = models.NodeStatusOnline
 	node.LastHeartbeat = now
-	if health.NodeID != "" && node.NodeID == "" {
-		node.NodeID = health.NodeID
-	}
 	return node, nil
 }
 
@@ -354,67 +257,10 @@ func (s *NodeService) StartHeartbeatMonitor(interval time.Duration) {
 			nodes, err := s.repo.FindAll(ctx)
 			if err == nil {
 				for _, n := range nodes {
-					_, probeErr := s.probeWorkerHealth(ctx, n.IP, n.Port)
-					now := time.Now().UTC()
-					if probeErr != nil {
-						if n.Status == models.NodeStatusOnline {
-							log.Printf("[HEARTBEAT] Node %s (%s:%d) is now OFFLINE", n.NodeID, n.IP, n.Port)
-							_ = s.repo.UpdateHeartbeat(ctx, n.ID, models.NodeStatusOffline, now)
-						}
-					} else {
-						if n.Status == models.NodeStatusOffline {
-							log.Printf("[HEARTBEAT] Node %s (%s:%d) is back ONLINE", n.NodeID, n.IP, n.Port)
-						}
-						_ = s.repo.UpdateHeartbeat(ctx, n.ID, models.NodeStatusOnline, now)
-					}
+					_, _ = s.CheckNodeHealth(ctx, n.ID)
 				}
 			}
 			cancel()
 		}
 	}()
-}
-
-func (s *NodeService) updateFileReplicasAfterSync(ctx context.Context, targetNode *models.StorageNode) {
-	if s.fileRepo == nil {
-		return
-	}
-	files, err := s.fileRepo.FindAll(ctx)
-	if err != nil {
-		log.Printf("[NODE_MGR] Warning: could not list files to update replicas: %v", err)
-		return
-	}
-
-	locName := strings.ToLower(targetNode.Country)
-	if locName == "" || locName == "unknown" {
-		locName = strings.ToLower(targetNode.Region)
-	}
-
-	for _, file := range files {
-		var updatedReplicas []models.Replica
-		hasTarget := false
-
-		for _, r := range file.Replicas {
-			normalizedLoc := r.Location
-			if normalizedLoc == "" || normalizedLoc == "local" {
-				normalizedLoc = "singapore"
-			}
-			updatedReplicas = append(updatedReplicas, models.Replica{
-				Location: normalizedLoc,
-				URL:      r.URL,
-			})
-			if r.URL == targetNode.BaseURL() || strings.EqualFold(r.Location, locName) {
-				hasTarget = true
-			}
-		}
-
-		if !hasTarget {
-			updatedReplicas = append(updatedReplicas, models.Replica{
-				Location: locName,
-				URL:      targetNode.BaseURL(),
-			})
-		}
-
-		_ = s.fileRepo.UpdateReplicas(ctx, file.ID, updatedReplicas)
-	}
-	log.Printf("[NODE_MGR] Updated file replicas in MongoDB across %d files for new node %s", len(files), targetNode.NodeID)
 }

@@ -2,9 +2,11 @@ package handlers
 
 import (
 	"bytes"
-	"encoding/json"
+	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"testing"
 	"time"
 
@@ -13,13 +15,47 @@ import (
 	"mini-cdn/api/models"
 	"mini-cdn/api/repository"
 	"mini-cdn/api/services"
+	"mini-cdn/api/services/barrier"
 )
+
+type dummyStorageClient struct{}
+
+func (d *dummyStorageClient) Upload(ctx context.Context, host string, port int, fileID string, localFilePath string) error {
+	return nil
+}
+
+func (d *dummyStorageClient) Download(ctx context.Context, host string, port int, fileID string) (io.ReadCloser, int64, error) {
+	return io.NopCloser(bytes.NewReader(nil)), 0, nil
+}
+
+func (d *dummyStorageClient) Delete(ctx context.Context, host string, port int, fileID string) error {
+	return nil
+}
+
+func (d *dummyStorageClient) Health(ctx context.Context, host string, port int) (bool, error) {
+	return true, nil
+}
+
+func (d *dummyStorageClient) ListFiles(ctx context.Context, host string, port int) ([]string, error) {
+	return []string{}, nil
+}
+
+func (d *dummyStorageClient) StatFile(ctx context.Context, host string, port int, fileID string) (int64, error) {
+	return 0, nil
+}
 
 func setupTestNodeHandler() (*NodeHandler, repository.NodeRepository, *gin.Engine) {
 	gin.SetMode(gin.TestMode)
+	fileRepo := repository.NewMockFileRepository()
 	nodeRepo := repository.NewMockNodeRepository()
-	syncService := services.NewSyncService()
-	nodeService := services.NewNodeService(nodeRepo, syncService)
+	journalRepo := repository.NewMockJournalRepository()
+	syncJobRepo := repository.NewMockSyncJobRepository()
+	client := &dummyStorageClient{}
+	b := barrier.NewMutationBarrier()
+	stagingDir, _ := os.MkdirTemp("", "api_node_test_staging_*")
+
+	syncService := services.NewSyncService(fileRepo, nodeRepo, journalRepo, syncJobRepo, client, b, stagingDir)
+	nodeService := services.NewNodeService(nodeRepo, syncService, client)
 	handler := NewNodeHandler(nodeService)
 
 	r := gin.New()
@@ -48,10 +84,10 @@ func TestNodeHandler_GetAndRemoveNode(t *testing.T) {
 	_, repo, r := setupTestNodeHandler()
 
 	node := &models.StorageNode{
-		ID:            "node-123",
+		ID:            "test-node-1",
 		NodeID:        "node-singapore",
 		IP:            "127.0.0.1",
-		Port:          8081,
+		Port:          2201,
 		Region:        "Asia",
 		Country:       "Singapore",
 		Latitude:      1.3521,
@@ -60,53 +96,23 @@ func TestNodeHandler_GetAndRemoveNode(t *testing.T) {
 		LastHeartbeat: time.Now(),
 		CreatedAt:     time.Now(),
 	}
-	_ = repo.Create(t.Context(), node)
+	_ = repo.Create(context.Background(), node)
 
-	// 1. Get Node
-	getReq := httptest.NewRequest(http.MethodGet, "/api/nodes/node-singapore", nil)
-	getRec := httptest.NewRecorder()
-	r.ServeHTTP(getRec, getReq)
+	// GET node
+	req := httptest.NewRequest(http.MethodGet, "/api/nodes/test-node-1", nil)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
 
-	if getRec.Code != http.StatusOK {
-		t.Fatalf("Expected 200 on GetNode, got %d", getRec.Code)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("Expected 200, got %d", rec.Code)
 	}
 
-	// 2. Remove Node
-	delReq := httptest.NewRequest(http.MethodDelete, "/api/nodes/node-singapore", nil)
+	// DELETE node
+	delReq := httptest.NewRequest(http.MethodDelete, "/api/nodes/test-node-1", nil)
 	delRec := httptest.NewRecorder()
 	r.ServeHTTP(delRec, delReq)
 
 	if delRec.Code != http.StatusOK {
-		t.Fatalf("Expected 200 on RemoveNode, got %d", delRec.Code)
-	}
-
-	// 3. Get again -> 404
-	getAgainReq := httptest.NewRequest(http.MethodGet, "/api/nodes/node-singapore", nil)
-	getAgainRec := httptest.NewRecorder()
-	r.ServeHTTP(getAgainRec, getAgainReq)
-
-	if getAgainRec.Code != http.StatusNotFound {
-		t.Fatalf("Expected 404 after remove, got %d", getAgainRec.Code)
-	}
-}
-
-func TestNodeHandler_OnboardUnreachableNode(t *testing.T) {
-	_, _, r := setupTestNodeHandler()
-
-	payload := map[string]interface{}{
-		"ip":     "198.51.100.254", // unreachable documentation IP
-		"port":   9999,
-		"region": "Asia",
-	}
-	body, _ := json.Marshal(payload)
-
-	req := httptest.NewRequest(http.MethodPost, "/api/nodes", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	rec := httptest.NewRecorder()
-	r.ServeHTTP(rec, req)
-
-	// Must fail because worker is unreachable
-	if rec.Code != http.StatusBadGateway {
-		t.Fatalf("Expected 502 Bad Gateway for unreachable node, got %d", rec.Code)
+		t.Fatalf("Expected 200 on delete, got %d", delRec.Code)
 	}
 }

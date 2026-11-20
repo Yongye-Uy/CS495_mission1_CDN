@@ -1,0 +1,5 @@
+# Docker/.gitignore
+# Exclude dynamically generated test keys and host artifacts
+keys/
+api/cdn_known_hosts
+*.log

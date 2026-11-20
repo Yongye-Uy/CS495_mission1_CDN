@@ -106,20 +106,31 @@ async function removeNode(id, nodeId) {
 
   showAlert(`Removing node ${displayName}...`, "info");
   try {
-    const res = await fetch(`/delete/${encodeURIComponent(id)}`, { method: "POST" });
+    const csrfToken = getCookie("cdn_csrf_token");
+    const headers = {};
+    if (csrfToken) {
+      headers["X-CSRF-Token"] = csrfToken;
+    }
+    const res = await fetch(`/api/nodes/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+      headers: headers,
+    });
     if (!res.ok) {
-      // Fallback direct delete to API
-      const direct = await fetch(`/api/nodes/${encodeURIComponent(id)}`, { method: "DELETE" });
-      if (!direct.ok) {
-        const errData = await direct.json().catch(() => ({}));
-        throw new Error(errData.error || `HTTP ${direct.status}`);
-      }
+      const errData = await res.json().catch(() => ({}));
+      throw new Error(errData.error || `HTTP ${res.status}`);
     }
     showAlert(`Storage node "${displayName}" removed successfully.`, "success");
     loadNodes();
   } catch (err) {
     showAlert(`Failed to remove node: ${err.message}`, "danger");
   }
+}
+
+function getCookie(name) {
+  const value = `; ${document.cookie}`;
+  const parts = value.split(`; ${name}=`);
+  if (parts.length === 2) return parts.pop().split(';').shift();
+  return "";
 }
 
 function showAlert(msg, type) {

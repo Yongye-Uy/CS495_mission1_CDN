@@ -2,23 +2,37 @@ package models
 
 import "time"
 
+const (
+	ReplicationStatusComplete = "COMPLETE" // 3/3 verified replicas
+	ReplicationStatusPartial  = "PARTIAL"  // 1/3 or 2/3 verified replicas
+	ReplicationStatusPending  = "PENDING"  // 0/3 replicas
+	ReplicationStatusFailed   = "FAILED"   // 0/3 replicas after retries
+)
+
 // Replica represents a copy of a file residing on a specific storage node.
 type Replica struct {
 	Location string `json:"location" bson:"location"` // e.g. "singapore", "newyork", "london", "local"
-	URL      string `json:"url" bson:"url"`           // Base URL of the storage node
+	URL      string `json:"url" bson:"url"`           // Base URL / identifier of the storage node
 }
 
 // FileMetadata represents the document saved in MongoDB.
 type FileMetadata struct {
-	ID           string    `json:"id" bson:"_id"`
-	OriginalName string    `json:"originalName" bson:"originalName"`
-	ContentType  string    `json:"contentType" bson:"contentType"`
-	Size         int64     `json:"size" bson:"size"`
-	CreatedAt    time.Time `json:"createdAt" bson:"createdAt"`
-	Replicas     []Replica `json:"replicas" bson:"replicas"`
+	ID                string    `json:"id" bson:"_id"`
+	OriginalName      string    `json:"originalName" bson:"originalName"`
+	ContentType       string    `json:"contentType" bson:"contentType"`
+	Size              int64     `json:"size" bson:"size"`
+	SHA256            string    `json:"sha256" bson:"sha256"`
+	CreatedAt         time.Time `json:"createdAt" bson:"createdAt"`
+	UpdatedAt         time.Time `json:"updatedAt" bson:"updatedAt"`
+	ReplicationStatus string    `json:"replicationStatus" bson:"replicationStatus"`
+	QuorumMet         bool      `json:"quorumMet" bson:"quorumMet"`
+	Replicas          []Replica `json:"replicas" bson:"replicas"`
+	StagedPath        string    `json:"stagedPath,omitempty" bson:"stagedPath,omitempty"`
+	RetryCount        int       `json:"retryCount" bson:"retryCount"`
+	IsDeleted         bool      `json:"isDeleted" bson:"isDeleted"`
 }
 
-// ReplicationStatus captures the outcome of replicating a file across storage nodes.
+// ReplicationResult captures the outcome of replicating a file across storage nodes.
 type ReplicationStatus struct {
 	Success            bool     `json:"success"`
 	Message            string   `json:"message"`

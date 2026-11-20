@@ -1,0 +1,152 @@
+services:
+  mongo:
+    image: mongo:7.0
+    container_name: cdn-mongo
+    restart: unless-stopped
+    command: ["--replSet", "rs0", "--bind_ip_all"]
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+    networks:
+      - cdn-net
+    healthcheck:
+      test: ["CMD-SHELL", "mongosh --quiet --eval \"try { rs.status().ok } catch(e) { rs.initiate({ _id: 'rs0', members: [{ _id: 0, host: 'mongo:27017' }] }).ok }\" | grep -E '^1$'"]
+      interval: 4s
+      timeout: 4s
+      retries: 10
+      start_period: 3s
+
+  storage-sg:
+    build:
+      context: ..
+      dockerfile: Docker/storage-ssh/Dockerfile
+    container_name: cdn-storage-sg
+    restart: unless-stopped
+    environment:
+      - CONTAINER_NODE_NAME=sg
+      - NODE_ID=node-sg
+      - REGION=Asia
+      - COUNTRY=Singapore
+    volumes:
+      - ./keys:/keys:ro
+      - storage_sg_data:/var/cdn/data
+    ports:
+      - "2201:22"
+    networks:
+      cdn-net:
+        aliases:
+          - storage-sg
+          - storage-sg.cdn-net
+
+  storage-us:
+    build:
+      context: ..
+      dockerfile: Docker/storage-ssh/Dockerfile
+    container_name: cdn-storage-us
+    restart: unless-stopped
+    environment:
+      - CONTAINER_NODE_NAME=us
+      - NODE_ID=node-us
+      - REGION=North America
+      - COUNTRY=United States
+    volumes:
+      - ./keys:/keys:ro
+      - storage_us_data:/var/cdn/data
+    ports:
+      - "2202:22"
+    networks:
+      cdn-net:
+        aliases:
+          - storage-us
+          - storage-us.cdn-net
+
+  storage-lon:
+    build:
+      context: ..
+      dockerfile: Docker/storage-ssh/Dockerfile
+    container_name: cdn-storage-lon
+    restart: unless-stopped
+    environment:
+      - CONTAINER_NODE_NAME=lon
+      - NODE_ID=node-lon
+      - REGION=Europe
+      - COUNTRY=United Kingdom
+    volumes:
+      - ./keys:/keys:ro
+      - storage_lon_data:/var/cdn/data
+    ports:
+      - "2203:22"
+    networks:
+      cdn-net:
+        aliases:
+          - storage-lon
+          - storage-lon.cdn-net
+
+  api:
+    build:
+      context: ..
+      dockerfile: Docker/api/Dockerfile
+    container_name: cdn-central-api
+    restart: unless-stopped
+    depends_on:
+      mongo:
+        condition: service_healthy
+      storage-sg:
+        condition: service_started
+      storage-us:
+        condition: service_started
+      storage-lon:
+        condition: service_started
+    environment:
+      - API_PORT=8080
+      - API_ENV=development
+      - MONGO_URI=mongodb://mongo:27017/cdn_metadata?replicaSet=rs0&directConnection=true
+      - MONGO_DB=cdn_metadata
+      - SSH_KEY_PATH=/keys/storage_test_key
+      - KNOWN_HOSTS_PATH=/app/cdn_known_hosts
+      - STAGING_DIR=/var/lib/mission1/staging
+      - ADMIN_API_KEY=admin_dev_secret_key_123
+    volumes:
+      - ./keys:/keys:ro
+      - ./api/cdn_known_hosts:/app/cdn_known_hosts:ro
+      - api_staging:/var/lib/mission1/staging
+    ports:
+      - "8080:8080"
+    networks:
+      - cdn-net
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 3s
+
+  website:
+    build:
+      context: ..
+      dockerfile: Docker/website/Dockerfile
+    container_name: cdn-website
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_started
+    environment:
+      - WEBSITE_PORT=3000
+      - API_BASE_URL=http://api:8080
+      - ADMIN_API_KEY=admin_dev_secret_key_123
+    ports:
+      - "3000:3000"
+    networks:
+      - cdn-net
+
+networks:
+  cdn-net:
+    driver: bridge
+
+volumes:
+  mongodb_data:
+  storage_sg_data:
+  storage_us_data:
+  storage_lon_data:
+  api_staging:

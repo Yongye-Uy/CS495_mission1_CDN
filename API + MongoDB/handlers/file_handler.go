@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -36,6 +37,7 @@ type JSONResponse struct {
 
 type UploadResponse struct {
 	Success     bool                      `json:"success"`
+	ID          string                    `json:"id,omitempty"`
 	File        *models.FileMetadata      `json:"file,omitempty"`
 	Replication *models.ReplicationStatus `json:"replication,omitempty"`
 	Error       string                    `json:"error,omitempty"`
@@ -110,6 +112,7 @@ func (h *FileHandler) Upload(c *gin.Context) {
 
 	c.JSON(statusCode, UploadResponse{
 		Success:     repStatus.Success,
+		ID:          meta.ID,
 		File:        meta,
 		Replication: repStatus,
 	})
@@ -179,6 +182,9 @@ func (h *FileHandler) Get(c *gin.Context) {
 	c.Header("Content-Type", meta.ContentType)
 	c.Header("Content-Disposition", fmt.Sprintf(`inline; filename="%s"`, meta.OriginalName))
 	c.Header("X-Served-By-Storage", servedByLoc)
+	if meta.Size > 0 {
+		c.Header("Content-Length", strconv.FormatInt(meta.Size, 10))
+	}
 
 	c.Status(http.StatusOK)
 	if _, copyErr := io.Copy(c.Writer, stream); copyErr != nil {
