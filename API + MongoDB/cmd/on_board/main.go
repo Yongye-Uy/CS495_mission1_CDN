@@ -53,7 +53,34 @@ func getAdminKey() string {
 	return ""
 }
 
+func loadEnvFile(paths ...string) {
+	for _, p := range paths {
+		data, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		lines := strings.Split(string(data), "\n")
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			parts := strings.SplitN(line, "=", 2)
+			if len(parts) == 2 {
+				k := strings.TrimSpace(parts[0])
+				v := strings.TrimSpace(parts[1])
+				v = strings.Trim(v, `"'`)
+				if os.Getenv(k) == "" {
+					os.Setenv(k, v)
+				}
+			}
+		}
+	}
+}
+
 func main() {
+	loadEnvFile(".env", "../.env")
+
 	if len(os.Args) < 2 {
 		printUsage()
 		os.Exit(1)
@@ -107,6 +134,7 @@ func printUsage() {
 }
 
 func handleAddNode(apiURL string, args []string) {
+	adminKey := getAdminKey()
 	req := OnboardRequest{
 		Port: 22,
 	}
@@ -114,6 +142,10 @@ func handleAddNode(apiURL string, args []string) {
 	for _, arg := range args {
 		if strings.HasPrefix(arg, "--api=") {
 			apiURL = strings.TrimPrefix(arg, "--api=")
+			continue
+		}
+		if strings.HasPrefix(arg, "--key=") {
+			adminKey = strings.TrimPrefix(arg, "--key=")
 			continue
 		}
 
@@ -126,6 +158,8 @@ func handleAddNode(apiURL string, args []string) {
 		val := strings.TrimSpace(parts[1])
 
 		switch key {
+		case "key", "admin_key", "adminkey":
+			adminKey = val
 		case "ip":
 			req.IP = val
 		case "region":
@@ -174,8 +208,10 @@ func handleAddNode(apiURL string, args []string) {
 		os.Exit(1)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	if key := getAdminKey(); key != "" {
-		httpReq.Header.Set("X-Admin-Key", key)
+	if adminKey != "" {
+		httpReq.Header.Set("X-Admin-Key", adminKey)
+	} else {
+		fmt.Println("[WARNING] No administrator key found (set ADMIN_API_KEY in .env, export CENTRAL_API_ADMIN_KEY, or pass key=<key>)")
 	}
 
 	resp, err := client.Do(httpReq)
