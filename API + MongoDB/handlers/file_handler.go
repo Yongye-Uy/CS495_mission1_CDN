@@ -6,7 +6,6 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"strconv"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -182,9 +181,9 @@ func (h *FileHandler) Get(c *gin.Context) {
 	c.Header("Content-Type", meta.ContentType)
 	c.Header("Content-Disposition", fmt.Sprintf(`inline; filename="%s"`, meta.OriginalName))
 	c.Header("X-Served-By-Storage", servedByLoc)
-	if meta.Size > 0 {
-		c.Header("Content-Length", strconv.FormatInt(meta.Size, 10))
-	}
+	// Note: Omit Content-Length header so HTTP uses chunked transfer encoding.
+	// This ensures that when a file on disk is replaced or modified (e.g. swapping with regional flags),
+	// the full file streams completely without being truncated by outdated metadata size.
 
 	c.Status(http.StatusOK)
 	if _, copyErr := io.Copy(c.Writer, stream); copyErr != nil {
