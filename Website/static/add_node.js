@@ -41,7 +41,6 @@ document.addEventListener("DOMContentLoaded", function () {
     const country = document.getElementById("nodeCountry").value.trim();
     const lat = parseFloat(document.getElementById("nodeLat").value) || 0;
     const lon = parseFloat(document.getElementById("nodeLon").value) || 0;
-    const csrfToken = document.getElementById("csrfToken")?.value || getCookie("cdn_csrf_token");
 
     if (!ip) {
       alert("Storage Server IP Address or Hostname is required.");
@@ -79,9 +78,6 @@ document.addEventListener("DOMContentLoaded", function () {
       const headers = {
         "Content-Type": "application/json",
       };
-      if (csrfToken) {
-        headers["X-CSRF-Token"] = csrfToken;
-      }
 
       const res = await fetch("/nodes/add", {
         method: "POST",
@@ -98,8 +94,8 @@ document.addEventListener("DOMContentLoaded", function () {
         progressSpinner.classList.add("d-none");
         const errMsg = data.error || `HTTP ${res.status}`;
         if (res.status === 401) {
-          showProgressAlert(`<strong>Authentication Required.</strong> Your session has expired. Redirecting to login...`, "warning");
-          setTimeout(() => { window.location.href = "/admin/login?next=/nodes/add"; }, 1500);
+          showProgressAlert(`<strong>Unauthorized:</strong> Central API rejected administrative key.`, "danger");
+          submitBtn.disabled = false;
           return;
         }
 
@@ -112,12 +108,12 @@ document.addEventListener("DOMContentLoaded", function () {
       // Success sequence
       setStepDone("step1", "Step 1: Host key verified. cdn-sync authenticated.");
       setStepDone("step2", "Step 2: Storage directory /var/cdn/data verified.");
-      setStepDone("step3", "Step 3: Initialized sync job and catalog snapshot.");
-      setStepActive("step4", "Step 4: Transferred catalog files & replaying mutation journal...");
+      setStepDone("step3", "Step 3: Initialized catalog snapshot.");
+      setStepActive("step4", "Step 4: Synchronizing catalog files via rsync...");
 
       setTimeout(() => {
-        setStepDone("step4", "Step 4: Catalog synchronized and mutations replayed.");
-        setStepDone("step5", "Step 5: Mutation barrier passed! Node activated to ONLINE.");
+        setStepDone("step4", "Step 4: Catalog synchronized.");
+        setStepDone("step5", "Step 5: Node activated to ONLINE.");
         progressSpinner.classList.add("d-none");
 
         showProgressAlert(

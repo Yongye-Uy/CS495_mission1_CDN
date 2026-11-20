@@ -6,9 +6,7 @@ import (
 	"io"
 	"log"
 	"os"
-	"path/filepath"
 	"strings"
-	"time"
 
 	"mini-cdn/api/models"
 	"mini-cdn/api/repository"
@@ -19,38 +17,27 @@ import (
 type SyncService struct {
 	fileRepo      repository.FileRepository
 	nodeRepo      repository.NodeRepository
-	journalRepo   repository.JournalRepository
-	syncJobRepo   repository.SyncJobRepository
 	storageClient ssh_client.StorageClient
 	barrier       *barrier.MutationBarrier
-	stagingDir    string
 }
 
 func NewSyncService(
 	fileRepo repository.FileRepository,
 	nodeRepo repository.NodeRepository,
-	journalRepo repository.JournalRepository,
-	syncJobRepo repository.SyncJobRepository,
 	storageClient ssh_client.StorageClient,
 	barrier *barrier.MutationBarrier,
-	stagingDir string,
 ) *SyncService {
-	if stagingDir == "" {
-		stagingDir = filepath.Join(os.TempDir(), "mission1_staging")
-	}
 	return &SyncService{
 		fileRepo:      fileRepo,
 		nodeRepo:      nodeRepo,
-		journalRepo:   journalRepo,
-		syncJobRepo:   syncJobRepo,
 		storageClient: storageClient,
 		barrier:       barrier,
-		stagingDir:    stagingDir,
 	}
 }
 
-// OnboardAndSynchronize executes the full two-phase mutation journal synchronization protocol,
-// audits file catalog convergence, and activates the storage node to ONLINE under the mutation barrier.
+// OnboardAndSynchronize executes the catalog-driven synchronization protocol,
+// audits file catalog convergence under an exclusive in-memory mutation barrier,
+// and activates the storage node to ONLINE.
 func (s *SyncService) OnboardAndSynchronize(ctx context.Context, targetNode *models.StorageNode) error {
 	if targetNode == nil {
 		return fmt.Errorf("target storage node is nil")
@@ -69,37 +56,18 @@ func (s *SyncService) OnboardAndSynchronize(ctx context.Context, targetNode *mod
 		return fmt.Errorf("storage node %s (%s:%d) health check failed: %w", targetNode.NodeID, targetNode.IP, port, err)
 	}
 
-	// Step 2: Initialize persistent sync job in MongoDB
-	startSeq, err := s.journalRepo.GetMaxSequence(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to retrieve current journal sequence: %w", err)
-	}
-
-	job := &models.SyncJob{
-		NodeID:          targetNode.NodeID,
-		Status:          models.SyncStatusSyncing,
-		StartSeq:        startSeq,
-		LastReplayedSeq: startSeq,
-		StartedAt:       time.Now(),
-		UpdatedAt:       time.Now(),
-	}
-
-	if err := s.syncJobRepo.CreateJob(ctx, job); err != nil {
-		return fmt.Errorf("failed to initialize persistent sync job: %w", err)
-	}
-
+	// Step 2: Mark node status as SYNCING in MongoDB
 	_ = s.nodeRepo.UpdateStatus(ctx, targetNode.NodeID, models.NodeStatusSyncing)
 
-	// Step 3: Phase 1 — Catalog-Driven Snapshot Synchronization
-	log.Printf("[SYNC] Phase 1: Snapshot sync initiated for %s from startSeq=%d", targetNode.NodeID, startSeq)
+	// Step 3: Phase 1 — Catalog-Driven Synchronization
+	log.Printf("[SYNC] Phase 1: Snapshot sync initiated for %s", targetNode.NodeID)
 	activeFiles, err := s.fileRepo.FindActive(ctx)
 	if err != nil {
-		_ = s.syncJobRepo.FailJob(ctx, targetNode.NodeID, err.Error())
+		_ = s.nodeRepo.UpdateStatus(ctx, targetNode.NodeID, models.NodeStatusError)
 		return fmt.Errorf("failed to query active files: %w", err)
 	}
 
-	job.TotalFiles = len(activeFiles)
-
+	syncedCount := 0
 	for _, file := range activeFiles {
 		if file.IsDeleted {
 			continue
@@ -107,50 +75,30 @@ func (s *SyncService) OnboardAndSynchronize(ctx context.Context, targetNode *mod
 		if err := s.transferFileToTarget(ctx, file, targetNode); err != nil {
 			failMsg := fmt.Sprintf("Missing source replica / transfer error for file %s (%s): %v", file.ID, file.OriginalName, err)
 			log.Printf("[SYNC] %s. Aborting onboarding activation.", failMsg)
-			_ = s.syncJobRepo.FailJob(ctx, targetNode.NodeID, failMsg)
 			_ = s.nodeRepo.UpdateStatus(ctx, targetNode.NodeID, models.NodeStatusError)
 			return fmt.Errorf("%s", failMsg)
 		}
-		job.SyncedFiles++
-		_ = s.syncJobRepo.UpdateJobProgress(ctx, targetNode.NodeID, job.LastReplayedSeq, job.SyncedFiles)
+		syncedCount++
 	}
 
-	log.Printf("[SYNC] Phase 1 completed: %d files transferred to %s.", job.SyncedFiles, targetNode.NodeID)
+	log.Printf("[SYNC] Phase 1 completed: %d files transferred to %s.", syncedCount, targetNode.NodeID)
 
-	// Step 4: Phase 2 — Ordered Journal Replay Loop
-	log.Printf("[SYNC] Phase 2: Catching up mutation journal records after seq %d...", job.LastReplayedSeq)
-	for {
-		entries, err := s.journalRepo.GetMutationsAfter(ctx, job.LastReplayedSeq)
-		if err != nil {
-			_ = s.syncJobRepo.FailJob(ctx, targetNode.NodeID, err.Error())
-			return fmt.Errorf("failed to query mutations after seq %d: %w", job.LastReplayedSeq, err)
-		}
-
-		if len(entries) <= 5 {
-			log.Printf("[SYNC] Journal backlog down to %d entries. Proceeding to final activation barrier.", len(entries))
-			break
-		}
-
-		for _, entry := range entries {
-			if err := s.applyJournalMutation(ctx, entry, targetNode); err != nil {
-				log.Printf("[SYNC] Warning: error applying journal mutation seq=%d to %s: %v", entry.Seq, targetNode.NodeID, err)
-			}
-			job.LastReplayedSeq = entry.Seq
-		}
-		_ = s.syncJobRepo.UpdateJobProgress(ctx, targetNode.NodeID, job.LastReplayedSeq, job.SyncedFiles)
-	}
-
-	// Step 5: Final Mutation Barrier Phase
+	// Step 4: Phase 2 — Final Reconciliation Barrier & Activation
 	log.Printf("[SYNC] Entering final mutation barrier for node %s...", targetNode.NodeID)
 	s.barrier.Lock()
 	defer s.barrier.Unlock()
 
-	// Replay final remaining journal tail under exclusive barrier lock
-	tailEntries, err := s.journalRepo.GetMutationsAfter(ctx, job.LastReplayedSeq)
-	if err == nil {
-		for _, entry := range tailEntries {
-			_ = s.applyJournalMutation(ctx, entry, targetNode)
-			job.LastReplayedSeq = entry.Seq
+	// Re-query active files under exclusive barrier lock to catch any concurrent mutations
+	latestActiveFiles, err := s.fileRepo.FindActive(ctx)
+	if err != nil {
+		_ = s.nodeRepo.UpdateStatus(ctx, targetNode.NodeID, models.NodeStatusError)
+		return fmt.Errorf("failed to query active files during final barrier: %w", err)
+	}
+
+	activeFilesMap := make(map[string]*models.FileMetadata)
+	for _, f := range latestActiveFiles {
+		if !f.IsDeleted {
+			activeFilesMap[f.ID] = f
 		}
 	}
 
@@ -158,7 +106,7 @@ func (s *SyncService) OnboardAndSynchronize(ctx context.Context, targetNode *mod
 	remoteFiles, err := s.storageClient.ListFiles(ctx, targetNode.IP, port)
 	if err != nil {
 		failMsg := fmt.Sprintf("Final SFTP directory audit failed on %s: %v", targetNode.NodeID, err)
-		_ = s.syncJobRepo.FailJob(ctx, targetNode.NodeID, failMsg)
+		_ = s.nodeRepo.UpdateStatus(ctx, targetNode.NodeID, models.NodeStatusError)
 		return fmt.Errorf("%s", failMsg)
 	}
 
@@ -167,17 +115,39 @@ func (s *SyncService) OnboardAndSynchronize(ctx context.Context, targetNode *mod
 		diskFilesMap[f] = true
 	}
 
-	// Verify all active catalog files are present on the new node
-	latestActiveFiles, _ := s.fileRepo.FindActive(ctx)
-	for _, f := range latestActiveFiles {
-		if f.IsDeleted {
-			continue
+	// 1. Delete any files on target disk that were deleted or are untracked
+	for diskFile := range diskFilesMap {
+		if _, ok := activeFilesMap[diskFile]; !ok {
+			log.Printf("[SYNC] Reconciling: removing deleted/untracked file %s from %s", diskFile, targetNode.NodeID)
+			_ = s.storageClient.Delete(ctx, targetNode.IP, port, diskFile)
 		}
-		if !diskFilesMap[f.ID] {
-			failMsg := fmt.Sprintf("Audit failure: active file %s (%s) missing from target disk on %s", f.ID, f.OriginalName, targetNode.NodeID)
-			_ = s.syncJobRepo.FailJob(ctx, targetNode.NodeID, failMsg)
-			_ = s.nodeRepo.UpdateStatus(ctx, targetNode.NodeID, models.NodeStatusError)
-			return fmt.Errorf("%s", failMsg)
+	}
+
+	// 2. Transfer any active files missing from target disk
+	for fileID, file := range activeFilesMap {
+		if !diskFilesMap[fileID] {
+			log.Printf("[SYNC] Reconciling: transferring missing active file %s to %s", fileID, targetNode.NodeID)
+			if err := s.transferFileToTarget(ctx, file, targetNode); err != nil {
+				failMsg := fmt.Sprintf("Audit failure: active file %s (%s) could not be synced to %s: %v", file.ID, file.OriginalName, targetNode.NodeID, err)
+				_ = s.nodeRepo.UpdateStatus(ctx, targetNode.NodeID, models.NodeStatusError)
+				return fmt.Errorf("%s", failMsg)
+			}
+		}
+	}
+
+	// Final verification of remote files
+	finalRemoteFiles, err := s.storageClient.ListFiles(ctx, targetNode.IP, port)
+	if err == nil {
+		finalMap := make(map[string]bool)
+		for _, f := range finalRemoteFiles {
+			finalMap[f] = true
+		}
+		for fileID, f := range activeFilesMap {
+			if !finalMap[fileID] {
+				failMsg := fmt.Sprintf("Final verification failure: file %s (%s) missing on %s", f.ID, f.OriginalName, targetNode.NodeID)
+				_ = s.nodeRepo.UpdateStatus(ctx, targetNode.NodeID, models.NodeStatusError)
+				return fmt.Errorf("%s", failMsg)
+			}
 		}
 	}
 
@@ -188,30 +158,8 @@ func (s *SyncService) OnboardAndSynchronize(ctx context.Context, targetNode *mod
 	}
 	_ = s.fileRepo.AddReplicaToActiveFiles(ctx, newReplica)
 	_ = s.nodeRepo.UpdateStatus(ctx, targetNode.NodeID, models.NodeStatusOnline)
-	_ = s.syncJobRepo.CompleteJob(ctx, targetNode.NodeID)
 
 	log.Printf("[SYNC] Barrier release! Node %s successfully onboarded and activated to ONLINE.", targetNode.NodeID)
-	return nil
-}
-
-func (s *SyncService) applyJournalMutation(ctx context.Context, entry *models.MutationJournalEntry, targetNode *models.StorageNode) error {
-	port := targetNode.Port
-	if port <= 0 {
-		port = 22
-	}
-
-	if entry.Op == models.OpDelete {
-		return s.storageClient.Delete(ctx, targetNode.IP, port, entry.FileID)
-	}
-
-	if entry.Op == models.OpUpload {
-		meta, err := s.fileRepo.FindByID(ctx, entry.FileID)
-		if err != nil || meta == nil || meta.IsDeleted {
-			return nil // File was subsequently deleted, skip
-		}
-		return s.transferFileToTarget(ctx, meta, targetNode)
-	}
-
 	return nil
 }
 
@@ -221,12 +169,7 @@ func (s *SyncService) transferFileToTarget(ctx context.Context, file *models.Fil
 		targetPort = 22
 	}
 
-	// 1. Primary: check if local staged copy exists on Central API
-	if file.StagedPath != "" && fileExists(file.StagedPath) {
-		return s.storageClient.Upload(ctx, targetNode.IP, targetPort, file.ID, file.StagedPath)
-	}
-
-	// 2. Secondary: stream from an online healthy replica holding the file
+	// Stream from an online healthy replica holding the file
 	for _, r := range file.Replicas {
 		sourceNode, err := s.nodeRepo.FindByNodeID(ctx, r.URL)
 		if err == nil && sourceNode != nil && sourceNode.Status == models.NodeStatusOnline {
@@ -236,16 +179,22 @@ func (s *SyncService) transferFileToTarget(ctx context.Context, file *models.Fil
 			}
 			stream, _, err := s.storageClient.Download(ctx, sourceNode.IP, sourcePort, file.ID)
 			if err == nil {
-				// Save to temp file on API and upload via rsync
-				tempPath := filepath.Join(s.stagingDir, fmt.Sprintf("%s.sync.%d", file.ID, time.Now().UnixNano()))
-				dst, err := os.Create(tempPath)
+				// Ephemeral temp file on API
+				tempFile, err := os.CreateTemp("", "cdn-sync-*")
 				if err != nil {
 					stream.Close()
 					continue
 				}
-				_, _ = io.Copy(dst, stream)
-				dst.Close()
-				stream.Close()
+				tempPath := tempFile.Name()
+
+				_, copyErr := io.Copy(tempFile, stream)
+				_ = tempFile.Close()
+				_ = stream.Close()
+
+				if copyErr != nil {
+					_ = os.Remove(tempPath)
+					continue
+				}
 
 				uploadErr := s.storageClient.Upload(ctx, targetNode.IP, targetPort, file.ID, tempPath)
 				_ = os.Remove(tempPath)
@@ -256,5 +205,5 @@ func (s *SyncService) transferFileToTarget(ctx context.Context, file *models.Fil
 		}
 	}
 
-	return fmt.Errorf("no available healthy source replica and no local staging copy found for file %s", file.ID)
+	return fmt.Errorf("no available healthy source replica found for file %s", file.ID)
 }

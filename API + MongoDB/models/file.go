@@ -6,7 +6,7 @@ const (
 	ReplicationStatusComplete = "COMPLETE" // 3/3 verified replicas
 	ReplicationStatusPartial  = "PARTIAL"  // 1/3 or 2/3 verified replicas
 	ReplicationStatusPending  = "PENDING"  // 0/3 replicas
-	ReplicationStatusFailed   = "FAILED"   // 0/3 replicas after retries
+	ReplicationStatusFailed   = "FAILED"   // 0/3 replicas
 )
 
 // Replica represents a copy of a file residing on a specific storage node.
@@ -27,12 +27,10 @@ type FileMetadata struct {
 	ReplicationStatus string    `json:"replicationStatus" bson:"replicationStatus"`
 	QuorumMet         bool      `json:"quorumMet" bson:"quorumMet"`
 	Replicas          []Replica `json:"replicas" bson:"replicas"`
-	StagedPath        string    `json:"stagedPath,omitempty" bson:"stagedPath,omitempty"`
-	RetryCount        int       `json:"retryCount" bson:"retryCount"`
 	IsDeleted         bool      `json:"isDeleted" bson:"isDeleted"`
 }
 
-// ReplicationResult captures the outcome of replicating a file across storage nodes.
+// ReplicationStatus captures the outcome of replicating a file across storage nodes.
 type ReplicationStatus struct {
 	Success            bool     `json:"success"`
 	Message            string   `json:"message"`

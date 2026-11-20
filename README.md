@@ -9,13 +9,12 @@ A distributed file storage and content delivery network (Mini CDN) built in idio
 The architecture consists of **two production applications** plus **native Linux storage instances**:
 
 1. **Website Frontend (`Website/`):**
-   - High-performance Go Gin application serving the web dashboard, file index, preview modals, and administrative interface.
-   - Admin authentication with bcrypt password verification, rate limiting, HttpOnly/SameSite session cookies (`cdn_admin_session`), and CSRF token protection.
-   - Built-in HTTPS reverse proxy that securely injects the `X-Admin-Key` header server-to-server.
+   - High-performance Go Gin application serving the web dashboard, file index, preview modals, and storage node management interface.
+   - Built-in reverse proxy that securely injects the `X-Admin-Key` header server-to-server for administrative node operations, keeping credentials completely hidden from client browsers.
 2. **Central API Controller (`API + MongoDB/`):**
-   - Central coordinator orchestrating file metadata, GeoIP proximity routing, replication management, and background recovery.
-   - Persistent storage in **MongoDB** configured as a single-node replica set (`rs0`) supporting multi-document atomic transactions.
-   - Replicated file mutations tracked via an append-only **Mutation Journal** (`mutation_journal` collection).
+   - Central coordinator orchestrating file metadata, GeoIP proximity routing, and parallel replication.
+   - Ephemeral upload buffering via `os.CreateTemp()` — uploads buffer temporarily for rsync and are automatically deleted upon upload completion.
+   - Persistent storage in **MongoDB** configured with a single-node replica set (`rs0`).
    - In-memory read-write **Mutation Barrier** ensuring consistency during node synchronization.
 3. **Storage Servers (Native Linux / AWS Lightsail):**
    - Ordinary Linux machines running standard **OpenSSH**, **SFTP**, and **rsync** under a dedicated `cdn-sync` user with `/var/cdn/data` (`chmod 750`).
@@ -31,8 +30,8 @@ The architecture consists of **two production applications** plus **native Linux
              ┌─────────────────────┐       ┌─────────────────────┐
              │    Website (Gin)    │       │    on_board (CLI)   │
              │      Port 3000      │       │     Go CLI Tool     │
-             │  • Admin Session    │       │  • CENTRAL_API_     │
-             │  • CSRF Protection  │       │    ADMIN_KEY Auth   │
+             │  • File Dashboard   │       │  • CENTRAL_API_     │
+             │  • Node Management  │       │    ADMIN_KEY Auth   │
              └──────────┬──────────┘       └──────────┬──────────┘
                         │                             │
                         │ HTTP / JSON                 │ HTTP / JSON
@@ -44,10 +43,9 @@ The architecture consists of **two production applications** plus **native Linux
                         │      Central API (Gin)      │
                         │          Port 8080          │
                         │  ─────────────────────────  │
-                        │  • Atomic Mongo Transactions│
+                        │  • Ephemeral Upload Buffers │
                         │  • Mutation Barrier RWLock  │
                         │  • 3/3 Strict Replication   │
-                        │  • Background Quorum Worker │
                         │  • GeoIP Proximity Routing  │
                         └──────────────┬──────────────┘
                                        │
@@ -60,10 +58,10 @@ The architecture consists of **two production applications** plus **native Linux
              │  ─────────────────  │       │ • US (us)           │
              │  • files            │       │ • London (lon)      │
              │  • storage_nodes    │       │  ─────────────────  │
-             │  • mutation_journal │       │  • OpenSSH / SFTP   │
-             │  • sync_jobs        │       │  • rsync over SSH   │
-             │  • atomic_counters  │       │  • /var/cdn/data    │
-             └─────────────────────┘       └─────────────────────┘
+             └─────────────────────┘       │  • OpenSSH / SFTP   │
+                                           │  • rsync over SSH   │
+                                           │  • /var/cdn/data    │
+                                           └─────────────────────┘
 ```
 
 ---
@@ -71,54 +69,42 @@ The architecture consists of **two production applications** plus **native Linux
 ## 2. Core Distributed Systems Protocols
 
 ### A. Strict 3/3 Complete Replication & Quorum
-- When a file is uploaded, it streams directly to `/var/lib/mission1/staging/<file_id>` while computing SHA-256.
-- The upload sequence, mutation journal entry, and file document are committed atomically in MongoDB.
-- Parallel rsync-over-SSH replicates the file across all 3 storage servers:
-  - **3/3 Replicas Succeeded:** Status becomes `COMPLETE`. The local staged file is safely deleted.
-  - **1/3 or 2/3 Succeeded:** Status becomes `PARTIAL` (`quorumMet: true` if $\ge 2$). The local staged file is **retained on disk**.
-  - **0/3 Succeeded:** Status becomes `FAILED`.
-- A background **Replication Recovery Worker** continuously scans for `PARTIAL` files and heals incomplete nodes using the retained staged file or healthy replicas.
+- When a file is uploaded, it is buffered into an ephemeral temporary file on Central API disk while computing SHA-256 and size.
+- Parallel rsync-over-SSH replicates the file across all active storage servers (Singapore, US, London):
+  - **3/3 Replicas Succeeded:** Status becomes `COMPLETE` (HTTP `201 Created`).
+  - **1/3 or 2/3 Succeeded:** Status becomes `PARTIAL` (HTTP `207 Multi-Status`, with `quorumMet: true` if $\ge 2$).
+  - **0/3 Succeeded:** Status becomes `FAILED` (HTTP `502 Bad Gateway`).
+- The ephemeral temporary file is immediately removed upon upload completion. Only verified replica nodes are recorded in MongoDB metadata.
 
-### B. Two-Phase Synchronization Protocol (Node Onboarding)
+### B. Catalog-Driven Node Synchronization
 When onboarding a new storage node:
-1. **Pre-flight Check:** Strict SSH host-key verification and `/var/cdn/data` accessibility probe.
-2. **Phase 1 (Snapshot):** Captures current sequence $S_{\text{start}}$. Copies all active catalog files to the new node via rsync.
-3. **Phase 2 (Catch-up Loop):** Reads and replays mutations where $\text{seq} > S_{\text{start}}$.
-4. **Final Barrier:** Acquires exclusive `MutationBarrier.Lock()`, replays the final journal tail, audits the remote filesystem via SFTP, commits node status to `ONLINE` in MongoDB, and releases the barrier.
-5. **Zero Zombie Files:** Deleted files are never resurrected on the new node.
+1. **Pre-flight Check:** Strict SSH host-key verification and `/var/cdn/data` accessibility probe. Node marked `SYNCING`.
+2. **Phase 1 (Catalog Transfer):** Copies active catalog files from online replicas to the target node via rsync over SSH using ephemeral temp buffers.
+3. **Phase 2 (Final Barrier & Reconciliation):** Acquires exclusive `MutationBarrier.Lock()`, reconciles any concurrent uploads or deletes, audits the remote filesystem via SFTP, removes any untracked or deleted files (ensuring zero zombie files), registers the new replica in MongoDB, and transitions the node to `ONLINE` before releasing the lock.
 
 ---
 
-## 3. Local Development & Docker Testing
+## 3. Server Setup Guides
 
-For local testing, Docker simulates the 3 isolated storage servers and replica set:
+Complete step-by-step setup guides for deploying to AWS Lightsail or Ubuntu VMs:
 
-```bash
-# 1. Generate local test SSH keypairs and cdn_known_hosts
-cd Docker
-./setup-test-ssh.sh       # On Linux/macOS
-# or:
-.\setup-test-ssh.ps1      # On Windows PowerShell
-
-# 2. Start the local cluster
-docker compose up -d --build
-
-# 3. Access Web Dashboard
-# Open http://localhost:3000
-```
+- [Server #1: Website Frontend Setup](file:///c:/Year4/CS%20495%20-%20Distributed%20Systems/Mission%201%20CDN/WEBSITE_SERVER_SETUP.md)
+- [Server #2: Central API & MongoDB Setup](file:///c:/Year4/CS%20495%20-%20Distributed%20Systems/Mission%201%20CDN/API_SERVER_SETUP.md)
+- [Servers #3, #4, #5: Storage Servers Setup](file:///c:/Year4/CS%20495%20-%20Distributed%20Systems/Mission%201%20CDN/STORAGE_SERVER_SETUP.md)
 
 ---
 
 ## 4. Administrative Security
 
-- **Central API Key:** Set via `CENTRAL_API_ADMIN_KEY` or `ADMIN_API_KEY`.
-- **Website Admin Sign-In:** Accessible at `/admin/login`. Guarded by bcrypt password verification and rate limiting (max 5 failed attempts per minute).
-- **Session Security:** `cdn_admin_session` cookie signed via HMAC-SHA256 with `HttpOnly`, `SameSite: Strict`, and 24-hour expiration.
-- **CSRF Protection:** Tokens validated on all mutation requests.
+- **Central API Key:** Set via `CENTRAL_API_ADMIN_KEY` on Website server and `ADMIN_API_KEY` on Central API server.
+- **Server-to-Server Injection:** The Website backend transparently injects `X-Admin-Key` when proxying or sending node mutations to Central API. The secret is never exposed to browser JavaScript or HTML.
+- **Node Management UI:** Direct access to `/nodes` and `/nodes/add` for ease of testing and grading.
 
 ---
 
 ## 5. CLI Usage (`on_board`)
+
+You can also manage storage nodes via the CLI tool on the Central API server:
 
 ```bash
 export API_URL="http://localhost:8080"

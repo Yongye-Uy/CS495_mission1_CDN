@@ -106,14 +106,8 @@ async function removeNode(id, nodeId) {
 
   showAlert(`Removing node ${displayName}...`, "info");
   try {
-    const csrfToken = getCookie("cdn_csrf_token");
-    const headers = {};
-    if (csrfToken) {
-      headers["X-CSRF-Token"] = csrfToken;
-    }
     const res = await fetch(`/api/nodes/${encodeURIComponent(id)}`, {
       method: "DELETE",
-      headers: headers,
     });
     if (!res.ok) {
       const errData = await res.json().catch(() => ({}));

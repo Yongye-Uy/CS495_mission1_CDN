@@ -3,8 +3,6 @@ package services_test
 import (
 	"context"
 	"fmt"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -21,19 +19,11 @@ import (
 func TestPhase3_ConcurrentMutationsDuringNodeSync(t *testing.T) {
 	fileRepo := repository.NewMockFileRepository()
 	nodeRepo := repository.NewMockNodeRepository()
-	journalRepo := repository.NewMockJournalRepository()
-	syncJobRepo := repository.NewMockSyncJobRepository()
 	mockStorage := newMockSSHStorageWorker()
 	defer mockStorage.close()
 
 	geoSvc := geo.NewGeoService()
 	b := barrier.NewMutationBarrier()
-
-	stagingDir, err := os.MkdirTemp("", "test_phase3_concurrency_*")
-	if err != nil {
-		t.Fatalf("Failed to create staging dir: %v", err)
-	}
-	defer os.RemoveAll(stagingDir)
 
 	// Pre-seed two initial online nodes (sg, ny)
 	sgNode := &models.StorageNode{
@@ -59,8 +49,8 @@ func TestPhase3_ConcurrentMutationsDuringNodeSync(t *testing.T) {
 	_ = nodeRepo.Create(context.Background(), sgNode)
 	_ = nodeRepo.Create(context.Background(), nyNode)
 
-	syncSvc := services.NewSyncService(fileRepo, nodeRepo, journalRepo, syncJobRepo, mockStorage, b, stagingDir)
-	fileSvc := services.NewFileService(fileRepo, nodeRepo, journalRepo, mockStorage, geoSvc, b, stagingDir, nil)
+	syncSvc := services.NewSyncService(fileRepo, nodeRepo, mockStorage, b)
+	fileSvc := services.NewFileService(fileRepo, nodeRepo, mockStorage, geoSvc, b, nil)
 
 	// 1. Pre-upload 3 initial files
 	for i := 1; i <= 3; i++ {
@@ -139,28 +129,20 @@ func TestPhase3_ConcurrentMutationsDuringNodeSync(t *testing.T) {
 		}
 	}
 
-	// 6. Verify Watermark Pruning
 	onlineNodes, _ := nodeRepo.FindOnline(context.Background())
 	if len(onlineNodes) != 3 {
 		t.Fatalf("Expected 3 online nodes, found %d", len(onlineNodes))
 	}
 }
 
-func TestPhase3_3Of3ReplicationAndStagingRetention(t *testing.T) {
+func TestPhase3_Strict3Of3Replication(t *testing.T) {
 	fileRepo := repository.NewMockFileRepository()
 	nodeRepo := repository.NewMockNodeRepository()
-	journalRepo := repository.NewMockJournalRepository()
 	mockStorage := newMockSSHStorageWorker()
 	defer mockStorage.close()
 
 	geoSvc := geo.NewGeoService()
 	b := barrier.NewMutationBarrier()
-
-	stagingDir, err := os.MkdirTemp("", "test_phase3_retention_*")
-	if err != nil {
-		t.Fatalf("Failed to create staging dir: %v", err)
-	}
-	defer os.RemoveAll(stagingDir)
 
 	// Pre-seed all 3 online nodes in nodeRepo
 	nodeSg := &models.StorageNode{ID: "node-sg", NodeID: "node-singapore", IP: "sg", Port: 22, Region: "Asia", Country: "Singapore", Status: models.NodeStatusOnline, CreatedAt: time.Now()}
@@ -170,9 +152,9 @@ func TestPhase3_3Of3ReplicationAndStagingRetention(t *testing.T) {
 	_ = nodeRepo.Create(context.Background(), nodeNy)
 	_ = nodeRepo.Create(context.Background(), nodeLon)
 
-	fileSvc := services.NewFileService(fileRepo, nodeRepo, journalRepo, mockStorage, geoSvc, b, stagingDir, nil)
+	fileSvc := services.NewFileService(fileRepo, nodeRepo, mockStorage, geoSvc, b, nil)
 
-	// Case A: 3/3 replication succeeds -> COMPLETE -> Staging file deleted
+	// Case A: 3/3 replication succeeds -> COMPLETE
 	content := "Data that replicates cleanly to all 3"
 	metaA, repStatusA, err := fileSvc.Upload(context.Background(), "complete.txt", "text/plain", strings.NewReader(content), int64(len(content)))
 	if err != nil {
@@ -181,12 +163,11 @@ func TestPhase3_3Of3ReplicationAndStagingRetention(t *testing.T) {
 	if repStatusA.Success != true || metaA.ReplicationStatus != models.ReplicationStatusComplete {
 		t.Fatalf("Expected ReplicationStatusComplete, got %s", metaA.ReplicationStatus)
 	}
-	// Verify local staging file removed
-	if _, err := os.Stat(filepath.Join(stagingDir, metaA.ID)); !os.IsNotExist(err) {
-		t.Errorf("Staging file for COMPLETE replication must be deleted, but still exists on disk")
+	if len(metaA.Replicas) != 3 {
+		t.Fatalf("Expected 3 replicas recorded, got %d", len(metaA.Replicas))
 	}
 
-	// Case B: 2/3 replication (one node failing) -> PARTIAL -> Staging file RETAINED
+	// Case B: 2/3 replication (one node failing) -> PARTIAL
 	mockStorage.SetNodeFailing("london", 22, true)
 	contentB := "Data with one node failure"
 	metaB, repStatusB, err := fileSvc.Upload(context.Background(), "partial.txt", "text/plain", strings.NewReader(contentB), int64(len(contentB)))
@@ -196,30 +177,19 @@ func TestPhase3_3Of3ReplicationAndStagingRetention(t *testing.T) {
 	if repStatusB.Success != false || metaB.ReplicationStatus != models.ReplicationStatusPartial {
 		t.Fatalf("Expected ReplicationStatusPartial, got %s", metaB.ReplicationStatus)
 	}
-	if metaB.StagedPath == "" {
-		t.Errorf("Expected StagedPath to be set for PARTIAL replication")
+	if !metaB.QuorumMet {
+		t.Errorf("Expected QuorumMet to be true for 2/3 replicas")
 	}
-	if _, err := os.Stat(metaB.StagedPath); os.IsNotExist(err) {
-		t.Errorf("Staging file for PARTIAL replication MUST be retained on disk, but was missing")
+	if len(metaB.Replicas) != 2 {
+		t.Errorf("Expected exactly 2 replicas recorded in metadata, got %d", len(metaB.Replicas))
 	}
 
-	// Case C: Recovery worker heals the node and cleans the staging file
-	mockStorage.SetNodeFailing("london", 22, false)
-	worker := services.NewReplicationRecoveryWorker(fileRepo, nodeRepo, mockStorage, b, stagingDir, 100*time.Millisecond)
-
-	// Run single iteration
-	worker.RunRecoveryCycle(context.Background())
-
-	// Verify status updated to COMPLETE in repo
-	updatedB, err := fileRepo.FindByID(context.Background(), metaB.ID)
-	if err != nil {
-		t.Fatalf("FindByID failed: %v", err)
-	}
-	if updatedB.ReplicationStatus != models.ReplicationStatusComplete {
-		t.Errorf("Expected RecoveryWorker to elevate status to COMPLETE, got %s", updatedB.ReplicationStatus)
-	}
-	// Verify staging file removed after recovery
-	if _, err := os.Stat(metaB.StagedPath); !os.IsNotExist(err) {
-		t.Errorf("Staging file should be deleted after successful recovery, but still exists")
+	// Case C: 0/3 replication (all nodes failing) -> ErrAllReplicasFailed
+	mockStorage.SetNodeFailing("sg", 22, true)
+	mockStorage.SetNodeFailing("ny", 22, true)
+	contentC := "Data with all nodes failing"
+	_, _, errC := fileSvc.Upload(context.Background(), "fail.txt", "text/plain", strings.NewReader(contentC), int64(len(contentC)))
+	if errC != services.ErrAllReplicasFailed {
+		t.Errorf("Expected ErrAllReplicasFailed when 0 replicas succeed, got %v", errC)
 	}
 }

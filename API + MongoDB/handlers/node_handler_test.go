@@ -6,7 +6,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"testing"
 	"time"
 
@@ -48,13 +47,10 @@ func setupTestNodeHandler() (*NodeHandler, repository.NodeRepository, *gin.Engin
 	gin.SetMode(gin.TestMode)
 	fileRepo := repository.NewMockFileRepository()
 	nodeRepo := repository.NewMockNodeRepository()
-	journalRepo := repository.NewMockJournalRepository()
-	syncJobRepo := repository.NewMockSyncJobRepository()
 	client := &dummyStorageClient{}
 	b := barrier.NewMutationBarrier()
-	stagingDir, _ := os.MkdirTemp("", "api_node_test_staging_*")
 
-	syncService := services.NewSyncService(fileRepo, nodeRepo, journalRepo, syncJobRepo, client, b, stagingDir)
+	syncService := services.NewSyncService(fileRepo, nodeRepo, client, b)
 	nodeService := services.NewNodeService(nodeRepo, syncService, client)
 	handler := NewNodeHandler(nodeService)
 

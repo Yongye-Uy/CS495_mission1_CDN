@@ -5,8 +5,6 @@ import (
 	"context"
 	"io"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -23,19 +21,11 @@ import (
 func TestEndToEnd_FullMission1Lifecycle(t *testing.T) {
 	fileRepo := repository.NewMockFileRepository()
 	nodeRepo := repository.NewMockNodeRepository()
-	journalRepo := repository.NewMockJournalRepository()
-	syncJobRepo := repository.NewMockSyncJobRepository()
 	mockStorage := newMockSSHStorageWorker()
 	defer mockStorage.close()
 
 	geoSvc := geo.NewGeoService()
 	barrierMutex := barrier.NewMutationBarrier()
-
-	stagingDir, err := os.MkdirTemp("", "e2e_staging_*")
-	if err != nil {
-		t.Fatalf("Failed to create staging dir: %v", err)
-	}
-	defer os.RemoveAll(stagingDir)
 
 	// Step 1: Pre-seed the 3 required physical storage servers (Singapore, US, London)
 	sgNode := &models.StorageNode{
@@ -78,8 +68,8 @@ func TestEndToEnd_FullMission1Lifecycle(t *testing.T) {
 	_ = nodeRepo.Create(context.Background(), usNode)
 	_ = nodeRepo.Create(context.Background(), lonNode)
 
-	syncSvc := services.NewSyncService(fileRepo, nodeRepo, journalRepo, syncJobRepo, mockStorage, barrierMutex, stagingDir)
-	fileSvc := services.NewFileService(fileRepo, nodeRepo, journalRepo, mockStorage, geoSvc, barrierMutex, stagingDir, nil)
+	syncSvc := services.NewSyncService(fileRepo, nodeRepo, mockStorage, barrierMutex)
+	fileSvc := services.NewFileService(fileRepo, nodeRepo, mockStorage, geoSvc, barrierMutex, nil)
 
 	// Step 2: Upload File & Verify Strict 3/3 Replication (COMPLETE)
 	flagData := []byte("PNG_HEADER_MOCK_FLAG_IMAGE_BINARY_DATA_FOR_CDN_PREVIEW_TEST")
@@ -99,11 +89,6 @@ func TestEndToEnd_FullMission1Lifecycle(t *testing.T) {
 	}
 	if len(repStatus.SuccessfulReplicas) != 3 {
 		t.Fatalf("Expected 3 successful replicas (Singapore, US, London), got: %d (%v)", len(repStatus.SuccessfulReplicas), repStatus.SuccessfulReplicas)
-	}
-
-	// Verify local staging file deleted after 3/3 verified
-	if _, err := os.Stat(filepath.Join(stagingDir, fileMeta.ID)); !os.IsNotExist(err) {
-		t.Errorf("Staging file must be removed when 3/3 replication succeeds")
 	}
 
 	// Verify file is stored on all 3 storage nodes

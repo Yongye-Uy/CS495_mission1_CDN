@@ -8,7 +8,6 @@ import (
 	"io"
 	"net/http/httptest"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -143,13 +142,9 @@ func (m *MockStorageClient) StatFile(ctx context.Context, host string, port int,
 func TestFileService_Upload3of3Complete(t *testing.T) {
 	repo := repository.NewMockFileRepository()
 	nodeRepo := repository.NewMockNodeRepository()
-	journalRepo := repository.NewMockJournalRepository()
 	client := NewMockStorageClient()
 	geoSvc := geo.NewGeoService()
 	b := barrier.NewMutationBarrier()
-	stagingDir := filepath.Join(os.TempDir(), "test_staging_complete")
-	_ = os.MkdirAll(stagingDir, 0700)
-	defer os.RemoveAll(stagingDir)
 
 	nodes := []models.Replica{
 		{Location: "singapore", URL: "sg:22"},
@@ -157,7 +152,7 @@ func TestFileService_Upload3of3Complete(t *testing.T) {
 		{Location: "london", URL: "london:22"},
 	}
 
-	svc := NewFileService(repo, nodeRepo, journalRepo, client, geoSvc, b, stagingDir, nodes)
+	svc := NewFileService(repo, nodeRepo, client, geoSvc, b, nodes)
 
 	content := "Hello 3/3 complete replication test"
 	meta, repStatus, err := svc.Upload(context.Background(), "test.txt", "text/plain", strings.NewReader(content), int64(len(content)))
@@ -175,24 +170,14 @@ func TestFileService_Upload3of3Complete(t *testing.T) {
 	if len(repStatus.SuccessfulReplicas) != 3 {
 		t.Errorf("Expected 3 successful replicas, got %d", len(repStatus.SuccessfulReplicas))
 	}
-
-	// Verify staged file is safely cleaned when COMPLETE
-	stagedPath := filepath.Join(stagingDir, meta.ID)
-	if _, err := os.Stat(stagedPath); !os.IsNotExist(err) {
-		t.Errorf("Expected local staged file to be cleaned up after 3/3 COMPLETE, but file still exists at %s", stagedPath)
-	}
 }
 
-func TestFileService_ReplicationStatusPartialRetainsStaging(t *testing.T) {
+func TestFileService_ReplicationStatusPartial(t *testing.T) {
 	repo := repository.NewMockFileRepository()
 	nodeRepo := repository.NewMockNodeRepository()
-	journalRepo := repository.NewMockJournalRepository()
 	client := NewMockStorageClient()
 	geoSvc := geo.NewGeoService()
 	b := barrier.NewMutationBarrier()
-	stagingDir := filepath.Join(os.TempDir(), "test_staging_partial")
-	_ = os.MkdirAll(stagingDir, 0700)
-	defer os.RemoveAll(stagingDir)
 
 	nodes := []models.Replica{
 		{Location: "singapore", URL: "sg:22"},
@@ -203,7 +188,7 @@ func TestFileService_ReplicationStatusPartialRetainsStaging(t *testing.T) {
 	// Simulate London failure
 	client.SetNodeFailing("london", 22, true)
 
-	svc := NewFileService(repo, nodeRepo, journalRepo, client, geoSvc, b, stagingDir, nodes)
+	svc := NewFileService(repo, nodeRepo, client, geoSvc, b, nodes)
 
 	content := "Partial replication data"
 	meta, repStatus, err := svc.Upload(context.Background(), "partial.pdf", "application/pdf", strings.NewReader(content), int64(len(content)))
@@ -224,24 +209,14 @@ func TestFileService_ReplicationStatusPartialRetainsStaging(t *testing.T) {
 	if len(meta.Replicas) != 2 {
 		t.Errorf("Expected exactly 2 replicas recorded in metadata, got %d", len(meta.Replicas))
 	}
-
-	// CRITICAL: Staged file must be retained on disk for recovery!
-	stagedPath := filepath.Join(stagingDir, meta.ID)
-	if _, err := os.Stat(stagedPath); os.IsNotExist(err) {
-		t.Errorf("Staged file MUST be retained when replication is PARTIAL, but file was deleted!")
-	}
 }
 
 func TestFileService_NearestServerAndFallback(t *testing.T) {
 	repo := repository.NewMockFileRepository()
 	nodeRepo := repository.NewMockNodeRepository()
-	journalRepo := repository.NewMockJournalRepository()
 	client := NewMockStorageClient()
 	geoSvc := geo.NewGeoService()
 	b := barrier.NewMutationBarrier()
-	stagingDir := filepath.Join(os.TempDir(), "test_staging_geo")
-	_ = os.MkdirAll(stagingDir, 0700)
-	defer os.RemoveAll(stagingDir)
 
 	nodes := []models.Replica{
 		{Location: "singapore", URL: "sg:22"},
@@ -249,7 +224,7 @@ func TestFileService_NearestServerAndFallback(t *testing.T) {
 		{Location: "london", URL: "london:22"},
 	}
 
-	svc := NewFileService(repo, nodeRepo, journalRepo, client, geoSvc, b, stagingDir, nodes)
+	svc := NewFileService(repo, nodeRepo, client, geoSvc, b, nodes)
 
 	content := "Test content for geolocation download"
 	meta, _, err := svc.Upload(context.Background(), "geo.txt", "text/plain", strings.NewReader(content), int64(len(content)))
@@ -288,13 +263,9 @@ func TestFileService_NearestServerAndFallback(t *testing.T) {
 func TestFileService_Delete(t *testing.T) {
 	repo := repository.NewMockFileRepository()
 	nodeRepo := repository.NewMockNodeRepository()
-	journalRepo := repository.NewMockJournalRepository()
 	client := NewMockStorageClient()
 	geoSvc := geo.NewGeoService()
 	b := barrier.NewMutationBarrier()
-	stagingDir := filepath.Join(os.TempDir(), "test_staging_del")
-	_ = os.MkdirAll(stagingDir, 0700)
-	defer os.RemoveAll(stagingDir)
 
 	nodes := []models.Replica{
 		{Location: "singapore", URL: "sg:22"},
@@ -302,7 +273,7 @@ func TestFileService_Delete(t *testing.T) {
 		{Location: "london", URL: "london:22"},
 	}
 
-	svc := NewFileService(repo, nodeRepo, journalRepo, client, geoSvc, b, stagingDir, nodes)
+	svc := NewFileService(repo, nodeRepo, client, geoSvc, b, nodes)
 
 	content := "Delete target"
 	meta, _, err := svc.Upload(context.Background(), "del.txt", "text/plain", strings.NewReader(content), int64(len(content)))

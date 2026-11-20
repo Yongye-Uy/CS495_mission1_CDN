@@ -88,11 +88,9 @@ func setupTestFileHandler() (*FileHandler, *gin.Engine) {
 	gin.SetMode(gin.TestMode)
 	repo := repository.NewMockFileRepository()
 	nodeRepo := repository.NewMockNodeRepository()
-	journalRepo := repository.NewMockJournalRepository()
 	client := newTestStorageClient()
 	geoSvc := geo.NewGeoService()
 	b := barrier.NewMutationBarrier()
-	stagingDir, _ := os.MkdirTemp("", "api_staging_test_handler_*")
 
 	nodes := []models.Replica{
 		{Location: "singapore", URL: "sg:22"},
@@ -100,7 +98,7 @@ func setupTestFileHandler() (*FileHandler, *gin.Engine) {
 		{Location: "london", URL: "london:22"},
 	}
 
-	svc := services.NewFileService(repo, nodeRepo, journalRepo, client, geoSvc, b, stagingDir, nodes)
+	svc := services.NewFileService(repo, nodeRepo, client, geoSvc, b, nodes)
 	handler := NewFileHandler(svc, 100)
 
 	r := gin.New()

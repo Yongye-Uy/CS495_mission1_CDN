@@ -9,20 +9,16 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"strings"
-	"time"
 
 	"github.com/gin-gonic/gin"
-	"golang.org/x/crypto/bcrypt"
 
 	"mini-cdn/website/internal/config"
-	"mini-cdn/website/internal/middleware"
 )
 
 type WebHandler struct {
-	cfg         *config.Config
-	apiTarget   *url.URL
-	proxy       *httputil.ReverseProxy
-	rateLimiter *middleware.RateLimiter
+	cfg       *config.Config
+	apiTarget *url.URL
+	proxy     *httputil.ReverseProxy
 }
 
 func NewWebHandler(cfg *config.Config) (*WebHandler, error) {
@@ -37,8 +33,8 @@ func NewWebHandler(cfg *config.Config) (*WebHandler, error) {
 	proxy.Director = func(req *http.Request) {
 		originalDirector(req)
 		req.Host = apiTarget.Host
-		if cfg.AdminAPIKey != "" {
-			req.Header.Set("X-Admin-Key", cfg.AdminAPIKey)
+		if cfg.CentralApiAdminKey != "" {
+			req.Header.Set("X-Admin-Key", cfg.CentralApiAdminKey)
 		}
 	}
 
@@ -50,10 +46,9 @@ func NewWebHandler(cfg *config.Config) (*WebHandler, error) {
 	}
 
 	return &WebHandler{
-		cfg:         cfg,
-		apiTarget:   apiTarget,
-		proxy:       proxy,
-		rateLimiter: middleware.NewRateLimiter(5, 1*time.Minute),
+		cfg:       cfg,
+		apiTarget: apiTarget,
+		proxy:     proxy,
 	}, nil
 }
 
@@ -83,74 +78,12 @@ func (h *WebHandler) NodesPage(c *gin.Context) {
 	})
 }
 
-// LoginPage renders the admin login page
-func (h *WebHandler) LoginPage(c *gin.Context) {
-	csrfToken, _ := c.Get("csrf_token")
-	tokenStr, _ := csrfToken.(string)
-	next := c.DefaultQuery("next", "/nodes/add")
-
-	c.HTML(http.StatusOK, "login.html", gin.H{
-		"CSRFToken": tokenStr,
-		"Next":      next,
-		"Error":     c.Query("error"),
-	})
-}
-
-// HandleLogin processes credentials, checks rate limits, and issues session cookie
-func (h *WebHandler) HandleLogin(c *gin.Context) {
-	clientIP := c.ClientIP()
-	if !h.rateLimiter.Allow(clientIP) {
-		c.HTML(http.StatusTooManyRequests, "login.html", gin.H{
-			"CSRFToken": c.GetString("csrf_token"),
-			"Next":      c.PostForm("next"),
-			"Error":     "Too many login attempts. Please wait 1 minute before trying again.",
-		})
-		return
-	}
-
-	password := c.PostForm("password")
-	next := c.PostForm("next")
-	if next == "" {
-		next = "/nodes/add"
-	}
-
-	// Verify bcrypt password
-	err := bcrypt.CompareHashAndPassword([]byte(h.cfg.AdminPasswordHash), []byte(password))
-	if err != nil {
-		c.HTML(http.StatusUnauthorized, "login.html", gin.H{
-			"CSRFToken": c.GetString("csrf_token"),
-			"Next":      next,
-			"Error":     "Invalid admin credentials.",
-		})
-		return
-	}
-
-	// Login successful: reset rate limiter
-	h.rateLimiter.Reset(clientIP)
-
-	// Issue signed session token
-	token := middleware.GenerateSessionToken(h.cfg.SessionSecret)
-	c.SetSameSite(http.SameSiteStrictMode)
-	c.SetCookie(middleware.SessionCookieName, token, int(middleware.SessionTTL.Seconds()), "/", "", false, true)
-
-	c.Redirect(http.StatusFound, next)
-}
-
-// HandleLogout clears the admin session cookie
-func (h *WebHandler) HandleLogout(c *gin.Context) {
-	c.SetSameSite(http.SameSiteStrictMode)
-	c.SetCookie(middleware.SessionCookieName, "", -1, "/", "", false, true)
-	c.Redirect(http.StatusFound, "/")
-}
-
-// AddNodePage renders the add storage node form (admin protected)
+// AddNodePage renders the add storage node form (direct access)
 func (h *WebHandler) AddNodePage(c *gin.Context) {
-	csrfToken, _ := c.Get("csrf_token")
 	c.HTML(http.StatusOK, "add_node.html", gin.H{
 		"ApiBaseURL":   h.cfg.ApiBaseURL,
 		"PublicApiURL": h.cfg.PublicApiURL,
 		"ActiveNav":    "add_node",
-		"CSRFToken":    csrfToken,
 	})
 }
 
@@ -172,8 +105,8 @@ func (h *WebHandler) HandleAddNode(c *gin.Context) {
 	req.Header.Set("Content-Type", c.GetHeader("Content-Type"))
 
 	// Inject server-to-server Admin Key securely
-	if h.cfg.AdminAPIKey != "" {
-		req.Header.Set("X-Admin-Key", h.cfg.AdminAPIKey)
+	if h.cfg.CentralApiAdminKey != "" {
+		req.Header.Set("X-Admin-Key", h.cfg.CentralApiAdminKey)
 	}
 
 	client := &http.Client{}

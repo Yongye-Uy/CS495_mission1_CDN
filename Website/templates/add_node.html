@@ -21,12 +21,6 @@
       </a>
 
       <div class="d-flex align-items-center gap-2 ms-auto">
-        <form action="/admin/logout" method="POST" class="d-inline">
-          <input type="hidden" name="csrf_token" value="{{ .CSRFToken }}">
-          <button type="submit" class="btn btn-sm btn-outline-secondary me-2">
-            <i class="bi bi-box-arrow-right me-1"></i>Sign Out
-          </button>
-        </form>
         <a href="/" class="btn btn-sm btn-outline-light">
           <i class="bi bi-arrow-left me-1"></i>Back to Home
         </a>
@@ -45,7 +39,7 @@
             <h5 class="fw-bold mb-0">
               <i class="bi bi-plus-square me-2 text-primary"></i>Onboard Storage Node
             </h5>
-            <small class="text-muted">Register, validate SSH host key, and synchronize data using rsync &amp; mutation journal</small>
+            <small class="text-muted">Register, validate SSH host key, and synchronize data using rsync &amp; catalog synchronization</small>
           </div>
           <a href="/nodes" class="btn btn-sm btn-outline-secondary">
             <i class="bi bi-hdd-stack me-1"></i>View Nodes
@@ -74,7 +68,6 @@
         </div>
 
         <form id="addNodeForm">
-          <input type="hidden" id="csrfToken" name="csrf_token" value="{{ .CSRFToken }}">
 
           <div class="mb-3">
             <label for="nodeIP" class="form-label small fw-bold">

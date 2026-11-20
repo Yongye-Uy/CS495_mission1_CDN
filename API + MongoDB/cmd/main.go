@@ -39,20 +39,14 @@ func main() {
 
 	repo, err := repository.NewMongoFileRepository(ctx, cfg.MongoURI, cfg.MongoDB)
 	var nodeRepo repository.NodeRepository
-	var journalRepo repository.JournalRepository
-	var syncJobRepo repository.SyncJobRepository
 
 	if err != nil {
 		log.Printf("[API] WARNING: Could not connect to MongoDB initially: %v", err)
 		log.Printf("[API] Using in-memory repositories fallback until MongoDB is online.")
 		nodeRepo = repository.NewMockNodeRepository()
-		journalRepo = repository.NewMockJournalRepository()
-		syncJobRepo = repository.NewMockSyncJobRepository()
 	} else {
 		log.Println("[API] Successfully connected to MongoDB.")
 		nodeRepo = repository.NewMongoNodeRepository(repo.Client(), cfg.MongoDB)
-		journalRepo = repository.NewMongoJournalRepository(repo.Client(), cfg.MongoDB)
-		syncJobRepo = repository.NewMongoSyncJobRepository(repo.Client(), cfg.MongoDB)
 	}
 
 	// Geolocation service
@@ -70,7 +64,7 @@ func main() {
 	}
 
 	// Sync service & Node service
-	syncService := services.NewSyncService(repo, nodeRepo, journalRepo, syncJobRepo, storageClient, barrierMutex, cfg.StagingDir)
+	syncService := services.NewSyncService(repo, nodeRepo, storageClient, barrierMutex)
 	nodeService := services.NewNodeService(nodeRepo, syncService, storageClient)
 	nodeService.SetFileRepo(repo)
 	nodeService.SetGeoService(geoService)
@@ -82,13 +76,9 @@ func main() {
 	nodeService.StartHeartbeatMonitor(20 * time.Second)
 
 	// File Service
-	fileService := services.NewFileService(repo, nodeRepo, journalRepo, storageClient, geoService, barrierMutex, cfg.StagingDir, cfg.StorageNodes)
+	fileService := services.NewFileService(repo, nodeRepo, storageClient, geoService, barrierMutex, cfg.StorageNodes)
 	fileHandler := handlers.NewFileHandler(fileService, cfg.MaxUploadSizeMB)
 	nodeHandler := handlers.NewNodeHandler(nodeService)
-
-	// Background Quorum Recovery Worker
-	recoveryWorker := services.NewReplicationRecoveryWorker(repo, nodeRepo, storageClient, barrierMutex, cfg.StagingDir, 30*time.Second)
-	recoveryWorker.Start(context.Background())
 
 	// Initialize Gin engine
 	r := gin.Default()

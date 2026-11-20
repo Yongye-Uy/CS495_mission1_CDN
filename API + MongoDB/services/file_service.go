@@ -19,8 +19,6 @@ import (
 	"sync"
 	"time"
 
-	"go.mongodb.org/mongo-driver/mongo"
-
 	"mini-cdn/api/models"
 	"mini-cdn/api/repository"
 	"mini-cdn/api/services/barrier"
@@ -37,37 +35,26 @@ var (
 type FileService struct {
 	repo          repository.FileRepository
 	nodeRepo      repository.NodeRepository
-	journalRepo   repository.JournalRepository
 	storageClient ssh_client.StorageClient
 	geoService    *geo.GeoService
 	barrier       *barrier.MutationBarrier
-	stagingDir    string
 	storageNodes  []models.Replica
 }
 
 func NewFileService(
 	repo repository.FileRepository,
 	nodeRepo repository.NodeRepository,
-	journalRepo repository.JournalRepository,
 	storageClient ssh_client.StorageClient,
 	geoService *geo.GeoService,
 	barrier *barrier.MutationBarrier,
-	stagingDir string,
 	storageNodes []models.Replica,
 ) *FileService {
-	if stagingDir == "" {
-		stagingDir = filepath.Join(os.TempDir(), "mission1_staging")
-	}
-	_ = os.MkdirAll(stagingDir, 0700)
-
 	return &FileService{
 		repo:          repo,
 		nodeRepo:      nodeRepo,
-		journalRepo:   journalRepo,
 		storageClient: storageClient,
 		geoService:    geoService,
 		barrier:       barrier,
-		stagingDir:    stagingDir,
 		storageNodes:  storageNodes,
 	}
 }
@@ -143,8 +130,9 @@ func (s *FileService) ResolveClientLocation(r *http.Request) geo.ClientLocation 
 	return s.geoService.ResolveClientLocation(r)
 }
 
-// Upload receives a stream, saves it to staging disk, records an atomic journal mutation,
-// replicates across active storage nodes, enforces 3/3 replication for COMPLETE, and retains staging if partial.
+// Upload receives a stream, saves it to an ephemeral temp file, computes SHA-256 and size,
+// replicates across active storage nodes via rsync over SSH, enforces 3/3 replication for COMPLETE,
+// updates MongoDB, and cleans up the ephemeral temp file immediately.
 func (s *FileService) Upload(
 	ctx context.Context,
 	filename string,
@@ -169,34 +157,33 @@ func (s *FileService) Upload(
 		}
 	}
 
-	// 2. Stream to durable local staging file while computing SHA-256
-	stagedPath := filepath.Join(s.stagingDir, fileID)
-	stageFile, err := os.OpenFile(stagedPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	// 2. Stream to ephemeral local temporary file on API disk
+	tempFile, err := os.CreateTemp("", "cdn-upload-*")
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to create staging file at %s: %w", stagedPath, err)
+		return nil, nil, fmt.Errorf("failed to create temporary upload file: %w", err)
 	}
+	tempPath := tempFile.Name()
+	defer func() {
+		_ = tempFile.Close()
+		_ = os.Remove(tempPath)
+	}()
 
 	hasher := sha256.New()
-	mw := io.MultiWriter(stageFile, hasher)
+	mw := io.MultiWriter(tempFile, hasher)
 
 	actualSize, copyErr := io.Copy(mw, fileReader)
-	closeErr := stageFile.Close()
 	if copyErr != nil {
-		_ = os.Remove(stagedPath)
-		return nil, nil, fmt.Errorf("failed to write staging file: %w", copyErr)
+		return nil, nil, fmt.Errorf("failed to write upload file: %w", copyErr)
 	}
-	if closeErr != nil {
-		_ = os.Remove(stagedPath)
-		return nil, nil, fmt.Errorf("failed to close staging file: %w", closeErr)
-	}
+	_ = tempFile.Close() // Close handle so rsync can read cleanly
+
 	if actualSize == 0 {
-		_ = os.Remove(stagedPath)
 		return nil, nil, errors.New("cannot upload empty file")
 	}
 
 	sha256Hex := hex.EncodeToString(hasher.Sum(nil))
 
-	// 3. Atomically commit file metadata and mutation journal entry via MongoDB transaction
+	// 3. Save initial metadata record in MongoDB
 	fileMeta := &models.FileMetadata{
 		ID:                fileID,
 		OriginalName:      filename,
@@ -208,62 +195,25 @@ func (s *FileService) Upload(
 		ReplicationStatus: models.ReplicationStatusPending,
 		QuorumMet:         false,
 		Replicas:          []models.Replica{},
-		StagedPath:        stagedPath,
-		RetryCount:        0,
 		IsDeleted:         false,
 	}
 
-	mongoClient := s.repo.Client()
-	if mongoClient != nil {
-		session, err := mongoClient.StartSession()
-		if err == nil {
-			defer session.EndSession(ctx)
-			_, txErr := session.WithTransaction(ctx, func(sc mongo.SessionContext) (interface{}, error) {
-				return s.journalRepo.RecordMutationTx(ctx, sc, models.OpUpload, fileID, filename, actualSize, sha256Hex, fileMeta)
-			})
-			if txErr != nil {
-				log.Printf("[API] Transaction error on upload: %v. Fallback to direct insertion.", txErr)
-				_ = s.repo.Create(ctx, fileMeta)
-				seq, _ := s.journalRepo.NextSequence(ctx)
-				_ = s.journalRepo.InsertEntry(ctx, &models.MutationJournalEntry{
-					Seq:       seq,
-					Op:        models.OpUpload,
-					FileID:    fileID,
-					Filename:  filename,
-					Size:      actualSize,
-					SHA256:    sha256Hex,
-					CreatedAt: time.Now(),
-				})
-			}
-		} else {
-			_ = s.repo.Create(ctx, fileMeta)
-		}
-	} else {
-		// In-memory or standalone test fallback
-		_ = s.repo.Create(ctx, fileMeta)
-		seq, _ := s.journalRepo.NextSequence(ctx)
-		_ = s.journalRepo.InsertEntry(ctx, &models.MutationJournalEntry{
-			Seq:       seq,
-			Op:        models.OpUpload,
-			FileID:    fileID,
-			Filename:  filename,
-			Size:      actualSize,
-			SHA256:    sha256Hex,
-			CreatedAt: time.Now(),
-		})
+	if err := s.repo.Create(ctx, fileMeta); err != nil {
+		return nil, nil, fmt.Errorf("failed to create file metadata: %w", err)
 	}
 
 	// 4. Discover active replication targets
 	targets := s.getActiveStorageNodes(ctx)
 	if len(targets) == 0 {
-		log.Printf("[API] Warning: no active storage nodes registered. File %s kept in staging.", fileID)
+		log.Printf("[API] Warning: no active storage nodes registered for %s", fileID)
+		_ = s.repo.UpdateReplicationStatus(ctx, fileID, models.ReplicationStatusFailed, false, nil)
 		repStatus := &models.ReplicationStatus{
 			Success:            false,
-			Message:            "File staged locally on API disk; zero storage nodes currently online.",
+			Message:            "Zero storage nodes currently online.",
 			SuccessfulReplicas: []string{},
 			FailedReplicas:     []string{"all"},
 		}
-		return fileMeta, repStatus, nil
+		return fileMeta, repStatus, ErrAllReplicasFailed
 	}
 
 	// 5. Parallel rsync replication over SSH to all active nodes
@@ -279,7 +229,7 @@ func (s *FileService) Upload(
 		wg.Add(1)
 		go func(node targetNode) {
 			defer wg.Done()
-			repErr := s.storageClient.Upload(ctx, node.ip, node.port, fileID, stagedPath)
+			repErr := s.storageClient.Upload(ctx, node.ip, node.port, fileID, tempPath)
 			if repErr != nil {
 				log.Printf("[API] Replication to %s (%s:%d) FAILED: %v", node.nodeID, node.ip, node.port, repErr)
 			} else {
@@ -308,7 +258,10 @@ func (s *FileService) Upload(
 		}
 	}
 
-	// 6. Enforce strict 3/3 replication rules
+	// 6. Enforce strict 3/3 replication rules:
+	// 3/3 successful = COMPLETE
+	// 1/3 or 2/3 successful = PARTIAL
+	// 0/3 = FAILED
 	totalRequired := len(targets)
 	successCount := len(successfulNodes)
 
@@ -323,24 +276,12 @@ func (s *FileService) Upload(
 		finalStatus = models.ReplicationStatusFailed
 	}
 
-	// 7. Staging File Retention Logic
-	// Only delete the staged copy when replication is 100% COMPLETE (e.g. 3/3 verified).
-	persistedStagedPath := stagedPath
-	if finalStatus == models.ReplicationStatusComplete {
-		log.Printf("[API] 3/3 Replication verified for %s. Safely cleaning local staging file.", fileID)
-		_ = os.Remove(stagedPath)
-		persistedStagedPath = ""
-	} else {
-		log.Printf("[API] Incomplete replication (%d/%d) for %s. Retaining local staged file for recovery.", successCount, totalRequired, fileID)
-	}
-
-	// 8. Update MongoDB with verified replicas only
+	// 7. Update MongoDB with verified replicas only
 	fileMeta.ReplicationStatus = finalStatus
 	fileMeta.QuorumMet = quorumMet
 	fileMeta.Replicas = successfulNodes
-	fileMeta.StagedPath = persistedStagedPath
 
-	_ = s.repo.UpdateReplicationStatus(ctx, fileID, finalStatus, quorumMet, successfulNodes, persistedStagedPath)
+	_ = s.repo.UpdateReplicationStatus(ctx, fileID, finalStatus, quorumMet, successfulNodes)
 
 	if successCount == 0 {
 		return fileMeta, nil, ErrAllReplicasFailed
@@ -357,7 +298,6 @@ func (s *FileService) Upload(
 }
 
 // GetFileStream retrieves the file stream by finding the geographically nearest healthy storage node.
-// Falls back gracefully to remaining replicas or the local staging directory.
 func (s *FileService) GetFileStream(ctx context.Context, fileID string, r *http.Request) (io.ReadCloser, *models.FileMetadata, string, error) {
 	meta, err := s.repo.FindByID(ctx, fileID)
 	if err != nil {
@@ -382,19 +322,10 @@ func (s *FileService) GetFileStream(ctx context.Context, fileID string, r *http.
 		log.Printf("[API] Failed to stream from replica %s (%s:%d): %v, falling back...", node.Location, host, port, err)
 	}
 
-	// 4. Staging Fallback if remote replicas are unavailable
-	if meta.StagedPath != "" {
-		if f, err := os.Open(meta.StagedPath); err == nil {
-			log.Printf("[API] Streaming file %s from local API staging copy (%s)", fileID, meta.StagedPath)
-			return f, meta, "api-staging", nil
-		}
-	}
-
 	return nil, nil, "", ErrNoAvailableServer
 }
 
-// Delete marks a file as deleted, commits an atomic DELETE mutation in the journal,
-// removes the staging file, and executes SFTP Remove across all replicas holding the file.
+// Delete marks a file as deleted in MongoDB and executes SFTP Remove across all replicas holding the file.
 func (s *FileService) Delete(ctx context.Context, fileID string) error {
 	// 1. Acquire Mutation Barrier Read Lock
 	s.barrier.RLock()
@@ -405,35 +336,12 @@ func (s *FileService) Delete(ctx context.Context, fileID string) error {
 		return err
 	}
 
-	// 2. Atomically record DELETE mutation and tombstone metadata via transaction
-	mongoClient := s.repo.Client()
-	if mongoClient != nil {
-		session, err := mongoClient.StartSession()
-		if err == nil {
-			defer session.EndSession(ctx)
-			_, _ = session.WithTransaction(ctx, func(sc mongo.SessionContext) (interface{}, error) {
-				return s.journalRepo.RecordDeleteTx(ctx, sc, fileID)
-			})
-		} else {
-			_ = s.repo.Delete(ctx, fileID)
-		}
-	} else {
-		_ = s.repo.Delete(ctx, fileID)
-		seq, _ := s.journalRepo.NextSequence(ctx)
-		_ = s.journalRepo.InsertEntry(ctx, &models.MutationJournalEntry{
-			Seq:       seq,
-			Op:        models.OpDelete,
-			FileID:    fileID,
-			CreatedAt: time.Now(),
-		})
+	// 2. Soft delete / tombstone metadata in MongoDB
+	if err := s.repo.Delete(ctx, fileID); err != nil {
+		return err
 	}
 
-	// 3. Remove local staging copy if present
-	if meta.StagedPath != "" {
-		_ = os.Remove(meta.StagedPath)
-	}
-
-	// 4. Execute SFTP Remove across all registered replicas
+	// 3. Execute SFTP Remove across all registered replicas holding the file
 	var wg sync.WaitGroup
 	for _, rep := range meta.Replicas {
 		wg.Add(1)

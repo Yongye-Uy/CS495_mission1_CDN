@@ -24,9 +24,8 @@ type FileRepository interface {
 	FindByID(ctx context.Context, id string) (*models.FileMetadata, error)
 	FindAll(ctx context.Context) ([]*models.FileMetadata, error)
 	FindActive(ctx context.Context) ([]*models.FileMetadata, error)
-	FindPendingReplication(ctx context.Context) ([]*models.FileMetadata, error)
 	UpdateReplicas(ctx context.Context, id string, replicas []models.Replica) error
-	UpdateReplicationStatus(ctx context.Context, id string, status string, quorumMet bool, replicas []models.Replica, stagedPath string) error
+	UpdateReplicationStatus(ctx context.Context, id string, status string, quorumMet bool, replicas []models.Replica) error
 	AddReplicaToActiveFiles(ctx context.Context, replica models.Replica) error
 	Delete(ctx context.Context, id string) error
 	Ping(ctx context.Context) error
@@ -113,31 +112,6 @@ func (m *MongoFileRepository) FindActive(ctx context.Context) ([]*models.FileMet
 	return m.FindAll(ctx)
 }
 
-func (m *MongoFileRepository) FindPendingReplication(ctx context.Context) ([]*models.FileMetadata, error) {
-	filter := bson.M{
-		"isDeleted": bson.M{"$ne": true},
-		"replicationStatus": bson.M{
-			"$in": []string{models.ReplicationStatusPartial, models.ReplicationStatusPending, models.ReplicationStatusFailed},
-		},
-		"retryCount": bson.M{"$lt": 10},
-	}
-	cursor, err := m.collection.Find(ctx, filter)
-	if err != nil {
-		return nil, fmt.Errorf("failed to query pending replication files: %w", err)
-	}
-	defer cursor.Close(ctx)
-
-	var files []*models.FileMetadata
-	for cursor.Next(ctx) {
-		var f models.FileMetadata
-		if err := cursor.Decode(&f); err != nil {
-			return nil, err
-		}
-		files = append(files, &f)
-	}
-	return files, nil
-}
-
 func (m *MongoFileRepository) UpdateReplicas(ctx context.Context, id string, replicas []models.Replica) error {
 	update := bson.M{
 		"$set": bson.M{
@@ -152,17 +126,13 @@ func (m *MongoFileRepository) UpdateReplicas(ctx context.Context, id string, rep
 	return nil
 }
 
-func (m *MongoFileRepository) UpdateReplicationStatus(ctx context.Context, id string, status string, quorumMet bool, replicas []models.Replica, stagedPath string) error {
+func (m *MongoFileRepository) UpdateReplicationStatus(ctx context.Context, id string, status string, quorumMet bool, replicas []models.Replica) error {
 	update := bson.M{
 		"$set": bson.M{
 			"replicationStatus": status,
 			"quorumMet":         quorumMet,
 			"replicas":          replicas,
-			"stagedPath":        stagedPath,
 			"updatedAt":         time.Now(),
-		},
-		"$inc": bson.M{
-			"retryCount": 1,
 		},
 	}
 	_, err := m.collection.UpdateOne(ctx, bson.M{"_id": id}, update)
@@ -271,18 +241,6 @@ func (m *MockFileRepository) FindActive(ctx context.Context) ([]*models.FileMeta
 	return m.FindAll(ctx)
 }
 
-func (m *MockFileRepository) FindPendingReplication(ctx context.Context) ([]*models.FileMetadata, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	var list []*models.FileMetadata
-	for _, meta := range m.files {
-		if !meta.IsDeleted && (meta.ReplicationStatus == models.ReplicationStatusPartial || meta.ReplicationStatus == models.ReplicationStatusPending || meta.ReplicationStatus == models.ReplicationStatusFailed) {
-			list = append(list, meta)
-		}
-	}
-	return list, nil
-}
-
 func (m *MockFileRepository) UpdateReplicas(ctx context.Context, id string, replicas []models.Replica) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -291,10 +249,11 @@ func (m *MockFileRepository) UpdateReplicas(ctx context.Context, id string, repl
 		return ErrNotFound
 	}
 	file.Replicas = replicas
+	file.UpdatedAt = time.Now()
 	return nil
 }
 
-func (m *MockFileRepository) UpdateReplicationStatus(ctx context.Context, id string, status string, quorumMet bool, replicas []models.Replica, stagedPath string) error {
+func (m *MockFileRepository) UpdateReplicationStatus(ctx context.Context, id string, status string, quorumMet bool, replicas []models.Replica) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	file, exists := m.files[id]
@@ -304,8 +263,7 @@ func (m *MockFileRepository) UpdateReplicationStatus(ctx context.Context, id str
 	file.ReplicationStatus = status
 	file.QuorumMet = quorumMet
 	file.Replicas = replicas
-	file.StagedPath = stagedPath
-	file.RetryCount++
+	file.UpdatedAt = time.Now()
 	return nil
 }
 
@@ -315,6 +273,7 @@ func (m *MockFileRepository) AddReplicaToActiveFiles(ctx context.Context, replic
 	for _, f := range m.files {
 		if !f.IsDeleted {
 			f.Replicas = append(f.Replicas, replica)
+			f.UpdatedAt = time.Now()
 		}
 	}
 	return nil
@@ -328,6 +287,7 @@ func (m *MockFileRepository) Delete(ctx context.Context, id string) error {
 		return ErrNotFound
 	}
 	file.IsDeleted = true
+	file.UpdatedAt = time.Now()
 	return nil
 }
 

@@ -134,15 +134,10 @@ func TestEndToEnd_OnboardingAndReplicationPipeline(t *testing.T) {
 	// Step B: Set up Repositories and Services
 	fileRepo := repository.NewMockFileRepository()
 	nodeRepo := repository.NewMockNodeRepository()
-	journalRepo := repository.NewMockJournalRepository()
-	syncJobRepo := repository.NewMockSyncJobRepository()
 	geoSvc := geo.NewGeoService()
 	b := barrier.NewMutationBarrier()
 
-	stagingDir, _ := os.MkdirTemp("", "api_staging_test_*")
-	defer os.RemoveAll(stagingDir)
-
-	syncSvc := services.NewSyncService(fileRepo, nodeRepo, journalRepo, syncJobRepo, mockStorage, b, stagingDir)
+	syncSvc := services.NewSyncService(fileRepo, nodeRepo, mockStorage, b)
 	nodeSvc := services.NewNodeService(nodeRepo, syncSvc, mockStorage)
 	nodeSvc.SetFileRepo(fileRepo)
 	nodeSvc.SetGeoService(geoSvc)
@@ -163,7 +158,7 @@ func TestEndToEnd_OnboardingAndReplicationPipeline(t *testing.T) {
 	}
 	_ = nodeRepo.Create(context.Background(), sgNode)
 
-	fileSvc := services.NewFileService(fileRepo, nodeRepo, journalRepo, mockStorage, geoSvc, b, stagingDir, nil)
+	fileSvc := services.NewFileService(fileRepo, nodeRepo, mockStorage, geoSvc, b, nil)
 	fileHandler := handlers.NewFileHandler(fileSvc, 100)
 	nodeHandler := handlers.NewNodeHandler(nodeSvc)
 
