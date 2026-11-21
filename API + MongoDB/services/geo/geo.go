@@ -39,13 +39,24 @@ type GeoService struct {
 func NewGeoService() *GeoService {
 	// Standard coordinates for storage locations
 	storageLocs := map[string]Coordinates{
-		"singapore": {Latitude: 1.3521, Longitude: 103.8198},
-		"newyork":   {Latitude: 40.7128, Longitude: -74.0060},
-		"london":    {Latitude: 51.5074, Longitude: -0.1278},
-		"japan":     {Latitude: 35.6762, Longitude: 139.6503},
-		"tokyo":     {Latitude: 35.6762, Longitude: 139.6503},
-		"asia":      {Latitude: 35.6762, Longitude: 139.6503},
-		"local":     {Latitude: 1.3521, Longitude: 103.8198}, // Single storage node default
+		"singapore":      {Latitude: 1.3521, Longitude: 103.8198},
+		"sg":             {Latitude: 1.3521, Longitude: 103.8198},
+		"columbus":       {Latitude: 39.9612, Longitude: -82.9988}, // AWS us-east-2 (Ohio / Columbus)
+		"ohio":           {Latitude: 39.9612, Longitude: -82.9988},
+		"virginia":       {Latitude: 37.4316, Longitude: -78.6569}, // AWS us-east-1
+		"newyork":        {Latitude: 40.7128, Longitude: -74.0060},
+		"us":             {Latitude: 38.9072, Longitude: -77.0369},
+		"usa":            {Latitude: 38.9072, Longitude: -77.0369},
+		"united states":  {Latitude: 38.9072, Longitude: -77.0369},
+		"london":         {Latitude: 51.5074, Longitude: -0.1278},
+		"uk":             {Latitude: 51.5074, Longitude: -0.1278},
+		"gb":             {Latitude: 51.5074, Longitude: -0.1278},
+		"great britain":  {Latitude: 51.5074, Longitude: -0.1278},
+		"united kingdom": {Latitude: 51.5074, Longitude: -0.1278},
+		"japan":          {Latitude: 35.6762, Longitude: 139.6503},
+		"tokyo":          {Latitude: 35.6762, Longitude: 139.6503},
+		"asia":           {Latitude: 1.3521, Longitude: 103.8198},
+		"local":          {Latitude: 1.3521, Longitude: 103.8198}, // Single storage node default
 	}
 
 	// Country test presets for local simulation
@@ -74,6 +85,12 @@ func NewGeoService() *GeoService {
 			Coords:      Coordinates{Latitude: 38.9072, Longitude: -77.0369},
 			IsTest:      true,
 		},
+		"UNITED STATES": {
+			Country:     "United States",
+			CountryCode: "US",
+			Coords:      Coordinates{Latitude: 38.9072, Longitude: -77.0369},
+			IsTest:      true,
+		},
 		"GB": {
 			Country:     "United Kingdom",
 			CountryCode: "GB",
@@ -86,7 +103,19 @@ func NewGeoService() *GeoService {
 			Coords:      Coordinates{Latitude: 51.5074, Longitude: -0.1278},
 			IsTest:      true,
 		},
+		"UNITED KINGDOM": {
+			Country:     "United Kingdom",
+			CountryCode: "GB",
+			Coords:      Coordinates{Latitude: 51.5074, Longitude: -0.1278},
+			IsTest:      true,
+		},
 		"SG": {
+			Country:     "Singapore",
+			CountryCode: "SG",
+			Coords:      Coordinates{Latitude: 1.3521, Longitude: 103.8198},
+			IsTest:      true,
+		},
+		"SINGAPORE": {
 			Country:     "Singapore",
 			CountryCode: "SG",
 			Coords:      Coordinates{Latitude: 1.3521, Longitude: 103.8198},
@@ -122,18 +151,24 @@ func (g *GeoService) GetCoordinatesForLocation(loc string) Coordinates {
 	if preset, ok := g.CountryPresets[locUpper]; ok {
 		return preset.Coords
 	}
-	// Common aliases
-	switch locLower {
-	case "asia", "japan", "tokyo", "jp":
-		return Coordinates{Latitude: 35.6762, Longitude: 139.6503}
-	case "singapore", "sg":
-		return Coordinates{Latitude: 1.3521, Longitude: 103.8198}
-	case "europe", "germany", "frankfurt", "de":
-		return Coordinates{Latitude: 50.1109, Longitude: 8.6821}
-	case "uk", "london", "great britain":
+	// Common aliases and substring matches
+	switch {
+	case strings.Contains(locLower, "columbus") || strings.Contains(locLower, "ohio") || strings.Contains(locLower, "us-east-2"):
+		return Coordinates{Latitude: 39.9612, Longitude: -82.9988}
+	case strings.Contains(locLower, "virginia") || strings.Contains(locLower, "us-east-1"):
+		return Coordinates{Latitude: 37.4316, Longitude: -78.6569}
+	case strings.Contains(locLower, "newyork") || strings.Contains(locLower, "ny") || strings.Contains(locLower, "us") || strings.Contains(locLower, "usa") || strings.Contains(locLower, "united states") || strings.Contains(locLower, "america"):
+		return Coordinates{Latitude: 38.9072, Longitude: -77.0369}
+	case strings.Contains(locLower, "uk") || strings.Contains(locLower, "london") || strings.Contains(locLower, "great britain") || strings.Contains(locLower, "united kingdom") || strings.Contains(locLower, "gb"):
 		return Coordinates{Latitude: 51.5074, Longitude: -0.1278}
-	case "us", "usa", "newyork", "ny":
-		return Coordinates{Latitude: 40.7128, Longitude: -74.0060}
+	case strings.Contains(locLower, "singapore") || strings.Contains(locLower, "sg"):
+		return Coordinates{Latitude: 1.3521, Longitude: 103.8198}
+	case strings.Contains(locLower, "asia") || strings.Contains(locLower, "japan") || strings.Contains(locLower, "tokyo") || strings.Contains(locLower, "jp"):
+		return Coordinates{Latitude: 35.6762, Longitude: 139.6503}
+	case strings.Contains(locLower, "europe") || strings.Contains(locLower, "germany") || strings.Contains(locLower, "frankfurt") || strings.Contains(locLower, "de"):
+		return Coordinates{Latitude: 50.1109, Longitude: 8.6821}
+	case strings.Contains(locLower, "paris") || strings.Contains(locLower, "france") || strings.Contains(locLower, "fr"):
+		return Coordinates{Latitude: 48.8566, Longitude: 2.3522}
 	}
 	return Coordinates{Latitude: 0, Longitude: 0}
 }

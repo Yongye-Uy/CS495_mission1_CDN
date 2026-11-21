@@ -181,6 +181,9 @@ func (h *FileHandler) Get(c *gin.Context) {
 	c.Header("Content-Type", meta.ContentType)
 	c.Header("Content-Disposition", fmt.Sprintf(`inline; filename="%s"`, meta.OriginalName))
 	c.Header("X-Served-By-Storage", servedByLoc)
+	c.Header("Cache-Control", "no-cache, no-store, must-revalidate")
+	c.Header("Pragma", "no-cache")
+	c.Header("Expires", "0")
 	// Note: Omit Content-Length header so HTTP uses chunked transfer encoding.
 	// This ensures that when a file on disk is replaced or modified (e.g. swapping with regional flags),
 	// the full file streams completely without being truncated by outdated metadata size.

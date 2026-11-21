@@ -234,7 +234,13 @@ func (s *NodeService) DetectNodeInfo(ctx context.Context, ip string) (*DetectedN
 		info.City = "Singapore"
 		info.Latitude = 1.3521
 		info.Longitude = 103.8198
-	} else if strings.Contains(ipLower, "us") || strings.Contains(ipLower, "ohio") || strings.Contains(ipLower, "virginia") {
+	} else if strings.Contains(ipLower, "columbus") || strings.Contains(ipLower, "ohio") {
+		info.Region = "US"
+		info.Country = "United States"
+		info.City = "Columbus"
+		info.Latitude = 39.9612
+		info.Longitude = -82.9988
+	} else if strings.Contains(ipLower, "us") || strings.Contains(ipLower, "virginia") {
 		info.Region = "US"
 		info.Country = "United States"
 		info.City = "New York"

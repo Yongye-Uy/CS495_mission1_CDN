@@ -67,10 +67,12 @@ func GenerateSafeFileID() string {
 }
 
 type targetNode struct {
-	nodeID   string
-	ip       string
-	port     int
-	location string
+	nodeID    string
+	ip        string
+	port      int
+	location  string
+	latitude  float64
+	longitude float64
 }
 
 // getActiveStorageNodes resolves the active online nodes from NodeRepository.
@@ -91,11 +93,23 @@ func (s *FileService) getActiveStorageNodes(ctx context.Context) []targetNode {
 				if loc == "" {
 					loc = "storage"
 				}
+				lat := n.Latitude
+				lon := n.Longitude
+				if (lat == 0 && lon == 0) && s.geoService != nil {
+					coords := s.geoService.GetCoordinatesForLocation(loc)
+					if coords.Latitude == 0 && coords.Longitude == 0 {
+						coords = s.geoService.GetCoordinatesForLocation(n.Country)
+					}
+					lat = coords.Latitude
+					lon = coords.Longitude
+				}
 				targets = append(targets, targetNode{
-					nodeID:   n.NodeID,
-					ip:       n.IP,
-					port:     port,
-					location: strings.ToLower(loc),
+					nodeID:    n.NodeID,
+					ip:        n.IP,
+					port:      port,
+					location:  strings.ToLower(loc),
+					latitude:  lat,
+					longitude: lon,
 				})
 			}
 			return targets
@@ -421,15 +435,28 @@ func (s *FileService) rankReplicas(ctx context.Context, clientLoc geo.ClientLoca
 		}
 
 		if !found {
-			switch strings.ToLower(rep.Location) {
-			case "singapore", "asia":
-				lat, lon = 1.3521, 103.8198
-			case "newyork", "us", "north america":
-				lat, lon = 40.7128, -74.0060
-			case "london", "europe":
-				lat, lon = 51.5074, -0.1278
-			default:
-				lat, lon = 0, 0
+			if s.geoService != nil {
+				coords := s.geoService.GetCoordinatesForLocation(rep.Location)
+				if coords.Latitude != 0 || coords.Longitude != 0 {
+					lat = coords.Latitude
+					lon = coords.Longitude
+					found = true
+				}
+			}
+			if !found {
+				repLocLower := strings.ToLower(rep.Location)
+				switch {
+				case strings.Contains(repLocLower, "singapore") || strings.Contains(repLocLower, "asia") || strings.Contains(repLocLower, "sg"):
+					lat, lon = 1.3521, 103.8198
+				case strings.Contains(repLocLower, "columbus") || strings.Contains(repLocLower, "ohio"):
+					lat, lon = 39.9612, -82.9988
+				case strings.Contains(repLocLower, "newyork") || strings.Contains(repLocLower, "us") || strings.Contains(repLocLower, "usa") || strings.Contains(repLocLower, "america"):
+					lat, lon = 38.9072, -77.0369
+				case strings.Contains(repLocLower, "london") || strings.Contains(repLocLower, "europe") || strings.Contains(repLocLower, "uk") || strings.Contains(repLocLower, "gb"):
+					lat, lon = 51.5074, -0.1278
+				default:
+					lat, lon = 0, 0
+				}
 			}
 		}
 
@@ -475,7 +502,19 @@ func (s *FileService) GetLocationDebug(ctx context.Context, fileID string, r *ht
 	distances := make(map[string]float64)
 	targets := s.getActiveStorageNodes(ctx)
 	for _, t := range targets {
-		coords := s.geoService.GetCoordinatesForLocation(t.location)
+		var coords geo.Coordinates
+		if t.latitude != 0 || t.longitude != 0 {
+			coords = geo.Coordinates{Latitude: t.latitude, Longitude: t.longitude}
+		} else if s.geoService != nil {
+			coords = s.geoService.GetCoordinatesForLocation(t.location)
+		}
+		if (coords.Latitude == 0 && coords.Longitude == 0) && s.nodeRepo != nil {
+			if node, err := s.nodeRepo.FindByNodeID(ctx, t.nodeID); err == nil && node != nil {
+				if node.Latitude != 0 || node.Longitude != 0 {
+					coords = geo.Coordinates{Latitude: node.Latitude, Longitude: node.Longitude}
+				}
+			}
+		}
 		dist := geo.Haversine(clientLoc.Coords, coords)
 		distances[t.location] = float64(int(dist*10)) / 10
 	}

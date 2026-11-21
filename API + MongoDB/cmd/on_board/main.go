@@ -192,6 +192,24 @@ func handleAddNode(apiURL string, args []string) {
 		req.Country = req.Region
 	}
 
+	if req.Latitude == 0 && req.Longitude == 0 {
+		regionLower := strings.ToLower(req.Region)
+		countryLower := strings.ToLower(req.Country)
+		if strings.Contains(regionLower, "columbus") || strings.Contains(regionLower, "ohio") {
+			req.Latitude = 39.9612
+			req.Longitude = -82.9988
+		} else if strings.Contains(regionLower, "lon") || strings.Contains(countryLower, "uk") || strings.Contains(countryLower, "kingdom") {
+			req.Latitude = 51.5074
+			req.Longitude = -0.1278
+		} else if strings.Contains(regionLower, "singapore") || strings.Contains(regionLower, "asia") || strings.Contains(countryLower, "singapore") {
+			req.Latitude = 1.3521
+			req.Longitude = 103.8198
+		} else if strings.Contains(regionLower, "us") || strings.Contains(countryLower, "us") || strings.Contains(countryLower, "states") {
+			req.Latitude = 38.9072
+			req.Longitude = -77.0369
+		}
+	}
+
 	fmt.Printf("[1/4] Connecting to Central API at %s...\n", apiURL)
 	fmt.Printf("[2/4] Verifying storage worker health at %s:%d...\n", req.IP, req.Port)
 

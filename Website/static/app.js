@@ -233,7 +233,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
     try {
       const country = window.realClientCountry || "KH";
-      const url = `${API_ENDPOINT}/files/${id}/location?country=${encodeURIComponent(country)}`;
+      const url = `${API_ENDPOINT}/files/${id}/location?country=${encodeURIComponent(country)}&_t=${Date.now()}`;
       const headers = { "X-Test-Country": country };
 
       const res = await fetch(url, { headers });
@@ -290,7 +290,7 @@ document.addEventListener("DOMContentLoaded", () => {
   // 4. Download File
   function downloadFile(id) {
     const country = window.realClientCountry || "KH";
-    const url = `${API_ENDPOINT}/files/${id}?country=${encodeURIComponent(country)}`;
+    const url = `${API_ENDPOINT}/files/${id}?country=${encodeURIComponent(country)}&_t=${Date.now()}`;
     window.open(url, "_blank");
   }
 
@@ -301,7 +301,7 @@ document.addEventListener("DOMContentLoaded", () => {
     previewBody.innerHTML = `<p class="text-muted"><i class="bi bi-hourglass-split me-1"></i>Loading preview...</p>`;
 
     const country = window.realClientCountry || "KH";
-    let fileUrl = `${API_ENDPOINT}/files/${id}?country=${encodeURIComponent(country)}`;
+    let fileUrl = `${API_ENDPOINT}/files/${id}?country=${encodeURIComponent(country)}&_t=${Date.now()}`;
     previewDownloadLink.href = fileUrl;
 
     if (type.startsWith("image/")) {
